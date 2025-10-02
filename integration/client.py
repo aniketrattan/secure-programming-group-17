@@ -2,9 +2,9 @@
 import asyncio
 import base64
 import pathlib
-from integration.crypto_services.base64url import b64url_decode, b64url_encode
-from integration.crypto_services.canonical import preimage_dm
-from integration.crypto_services.rsa import decrypt_rsa_oaep, encrypt_rsa_oaep, generate_rsa4096_keypair, sign_pss_sha256, verify_pss_sha256
+from crypto_services.base64url import b64url_decode, b64url_encode
+from crypto_services.canonical import preimage_dm
+from crypto_services.rsa import decrypt_rsa_oaep, encrypt_rsa_oaep, generate_rsa4096_keypair, sign_pss_sha256, verify_pss_sha256
 import websockets
 import uuid
 import protocol
@@ -34,7 +34,7 @@ private_key, public_key = "", ""
 class Client():
 
     def __init__(self):
-        self.private_key, self.public_key = generate_rsa4096_keypair()
+        self.__private_key, self.public_key = generate_rsa4096_keypair()
 
     async def sender(self, ws, user_id):
         loop = asyncio.get_event_loop()
@@ -61,12 +61,12 @@ class Client():
                 # content_sig = sign_pss_sha256(ciphertext, sender_private)
 
 
-                msg = msg.encode("utf-8")
-                ciphertext = encrypt_rsa_oaep(msg, receiver_public)
-                ciphertext = b64url_encode(ciphertext)
-                pm_msg = preimage_dm(ciphertext, "1" ,"2", 1759388690830)
+                # msg = msg.encode("utf-8")
+                # ciphertext = encrypt_rsa_oaep(msg, receiver_public)
+                # ciphertext = b64url_encode(ciphertext)
+                # pm_msg = preimage_dm(ciphertext, "1" ,"2", 1759388690830)
 
-                content_sig = sign_pss_sha256(pm_msg, sender_private)
+                # content_sig = sign_pss_sha256(pm_msg, sender_private)
 
                 # DM plaintext 
                 dm = protocol.make_envelope(
@@ -74,9 +74,9 @@ class Client():
                     from_id=user_id, 
                     to_id=target, 
                     payload={
-                        "ciphertext": ciphertext,
-                        "sender_pub": sender_public,
-                        "content_sig": content_sig
+                        "ciphertext": msg,
+                        "sender_pub": "sender_pub",
+                        "content_sig": "content_sig"
                     },
                     sig="")
                 await ws.send(dm)
@@ -204,7 +204,7 @@ class Client():
 
 
 
-    async def receiver(ws):
+    async def receiver(self, ws):
 
         files_in_progress = {}
 
@@ -221,24 +221,24 @@ class Client():
                 private_key = "" # TODO: fetch from database
 
 
-                pm_rec = preimage_dm(ciphertext, "1", "2", 1759388690830)
-                # verify content  
-                if verify_pss_sha256(pm_rec, content_sig, sender_pub):
+                # pm_rec = preimage_dm(ciphertext, "1", "2", 1759388690830)
+                # # verify content  
+                # if verify_pss_sha256(pm_rec, content_sig, sender_pub):
 
-                    # decode and decrypt
-                    plaintext = decrypt_rsa_oaep(b64url_decode(ciphertext), private_key)
-                    text = plaintext.decode('utf-8')
+                #     # decode and decrypt
+                #     plaintext = decrypt_rsa_oaep(b64url_decode(ciphertext), private_key)
+                #     text = plaintext.decode('utf-8')
 
-                    print(f"Decrypted: {text}")
+                #     print(f"Decrypted: {text}")
 
 
-                # verify content  
-                if verify_pss_sha256(ciphertext, content_sig, sender_pub):
+                # # verify content  
+                # if verify_pss_sha256(ciphertext, content_sig, sender_pub):
 
-                    # decode and decrypt
-                    plaintext = decrypt_rsa_oaep(b64url_decode(ciphertext), private_key)
+                #     # decode and decrypt
+                #     plaintext = decrypt_rsa_oaep(b64url_decode(ciphertext), private_key)
                     
-                    print(f"DM from {frame['payload'].get('sender')}: {plaintext}")
+                #     print(f"DM from {frame['payload'].get('sender')}: {plaintext}")
 
             
             
@@ -281,7 +281,7 @@ class Client():
 
 
 
-    async def run_client(user_id=None, host="localhost", port=8765):
+    async def run_client(self, user_id=None, host="localhost", port=8765):
         if not user_id:
             user_id = str(uuid.uuid4())  # User UUIDv4
         uri = f"ws://{host}:{port}"
@@ -305,4 +305,4 @@ class Client():
 
             # TODO: retry mechanism
 
-            await asyncio.gather(sender(ws, user_id), receiver(ws))
+            await asyncio.gather(self.sender(ws, user_id), self.receiver(ws))
