@@ -186,6 +186,14 @@ class SecureMessagingDB:
             logger.error(f"Failed to register user {user_id}: {e}")
             raise ValueError(f"User ID {user_id} already exists")
     
+    def get_hashed_password(self, user_id: str) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("""
+                SELECT pake_password FROM users WHERE user_id = ?
+            """, (user_id,)).fetchone()
+            
+            return row[0] if row else None
+
     def authenticate_user(self, user_id: str, password: str) -> Optional[str]:
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute("""

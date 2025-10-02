@@ -2,6 +2,8 @@ from os import urandom
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from argon2 import PasswordHasher
+
 
 SCRYPT_N = 16384
 SCRYPT_R = 8
@@ -10,6 +12,9 @@ KEY_LEN = 32
 NONCE_LEN = 12
 SALT_LEN = 16
 
+
+def get_password_hasher():
+    return PasswordHasher()
 
 def _kdf(password: str, salt: bytes) -> bytes:
     kdf = Scrypt(salt=salt, length=KEY_LEN, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
