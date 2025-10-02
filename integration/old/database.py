@@ -117,15 +117,6 @@ class SecureMessagingDB:
                     FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
                 )
             """)
-
-            # Minimal public-channel membership table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS channel_members (
-                    channel_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    PRIMARY KEY (channel_id, user_id)
-                )
-            """)
             
             # Indexes
             conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users (status)")
@@ -139,8 +130,6 @@ class SecureMessagingDB:
             
             conn.commit()
             logger.info("Database initialized successfully (SOCP v1.3 compliant)")
-        # Ensure existence after closing prior write transaction to avoid locks
-        self.ensure_public_channel_exists()
     
     def _initialize_public_channel(self, conn):
         """ADDED: Initialize the required public channel per SOCP spec."""
@@ -153,54 +142,6 @@ class SecureMessagingDB:
                 VALUES ('public', 'system', ?, '{"title": "Public Channel"}', 1)
             """, (int(datetime.now(timezone.utc).timestamp()),))
             logger.info("Public channel initialized")
-
-    # ---- Public channel minimal membership helpers ----
-    def ensure_public_channel_exists(self) -> str:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT group_id FROM groups WHERE group_id='public'").fetchone()
-            if not row:
-                conn.execute("""
-                    INSERT INTO groups (group_id, creator_id, created_at, meta, version)
-                    VALUES ('public', 'system', ?, '{"title":"Public Channel"}', 1)
-                """, (int(datetime.now(timezone.utc).timestamp()),))
-                conn.commit()
-        return "public"
-
-    def add_member_to_public(self, user_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES ('public', ?)",
-                (user_id,)
-            )
-            conn.commit()
-
-    def remove_member_from_public(self, user_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "DELETE FROM channel_members WHERE channel_id='public' AND user_id=?",
-                (user_id,)
-            )
-            conn.commit()
-
-    def get_public_members(self) -> List[str]:
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT user_id FROM channel_members WHERE channel_id='public'"
-            ).fetchall()
-            return [r[0] for r in rows]
-
-    def get_display_name(self, user_id: str) -> str:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT meta FROM users WHERE user_id=?", (user_id,)).fetchone()
-            if row and row[0]:
-                try:
-                    meta = json.loads(row[0])
-                    name = meta.get('display_name')
-                    if name:
-                        return name
-                except Exception:
-                    pass
-            return user_id
     
     def generate_user_id(self) -> str:
         return str(uuid.uuid4())
@@ -260,6 +201,7 @@ class SecureMessagingDB:
             
             # In production: perform PAKE verification here
             # For now, simplified check
+
             session_id = self.create_session(stored_user_id)
             print(f"Session ID: session_id")
             return stored_user_id
@@ -525,5 +467,3 @@ class SecureMessagingDB:
                     'last_seen': row[3]
                 })
             return result
-
-

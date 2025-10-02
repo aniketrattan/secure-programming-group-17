@@ -34,5 +34,3 @@ def recover_private_key(blob: bytes, password: str) -> bytes:
     key = _kdf(password, salt)
     aesgcm = AESGCM(key)
     return aesgcm.decrypt(nonce, ct, associated_data=None)
-
-

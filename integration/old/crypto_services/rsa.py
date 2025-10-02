@@ -118,3 +118,24 @@ def verify_pss_sha256(message: bytes, signature: bytes, pub: rsa.RSAPublicKey) -
         return False
 
 
+private1, public1 = generate_rsa4096_keypair()
+
+private2, public2 = generate_rsa4096_keypair()
+
+
+print("private1")
+
+print(private1)
+
+
+print("public1")
+print(public1)
+
+
+print("private2")
+
+print(private2)
+
+
+print("public2")
+print(public2)

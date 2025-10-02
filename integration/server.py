@@ -1,278 +1,249 @@
 import asyncio
 import websockets
-import protocol, tables
-import db
-from customised_types import ServerMessageType, CustomisedMessageType
+import json
+import time
+
+from . import tables
+from .protocol import make_envelope, parse_envelope
+from .customised_types import ServerMessageType, CustomisedMessageType
+from .database import SecureMessagingDB
+from .transport import generate_server_keys, sign_transport_payload
 
 
-SERVER_ID = "server-1"  # TODO: should be UUIDv4
-
-def extract_server_id(to_server):
-    prefix = "server_"
-    return to_server[len(prefix):]
-
-
-def remove_user(user_id):
-    tables.local_users.pop(user_id)
-    tables.user_locations.pop(user_id)
+SERVER_ID = "server-1"  # placeholder UUID
+db = SecureMessagingDB()
+_SERVER_PRIV_DER, SERVER_PUB_B64 = generate_server_keys()
 
 
 async def handle_client(ws):
-    """Handle messages from a connected user (spec §9)"""
     user_id = None
     try:
         async for raw in ws:
-            frame = protocol.parse_envelope(raw)
+            frame = parse_envelope(raw)
             if not frame:
                 continue
 
             msg_type = frame.get("type")
 
-            # Handle user hello
             if msg_type == "USER_HELLO":
                 user_id = frame["from"]
                 if user_id in tables.local_users:
-                    # Duplicate name error
-                    await ws.send(protocol.make_envelope(
-                        msg_type="ERROR", 
-                        from_id=SERVER_ID, 
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
                         to_id=user_id,
-                        payload= {
-                            "code": "NAME_IN_USE", 
-                            "detail": "User id already existed"}
+                        payload={"code": "NAME_IN_USE", "detail": "User id already existed"}
                     ))
                 else:
-                    # Register on acceptance
                     tables.local_users[user_id] = ws
                     tables.user_locations[user_id] = "local"
-                    print(f"[SERVER] Registered user {user_id}")
-
-
-                    # acknowledge user hello request
-                    await ws.send(protocol.make_envelope(
-                        msg_type="ACK", 
-                        from_id=SERVER_ID, 
+                    # Optionally store pubkeys if provided
+                    payload = frame.get("payload", {})
+                    if payload.get("pubkey"):
+                        # Persist user registration minimally if not present
+                        try:
+                            db.register_user(user_id, payload.get("pubkey"), "SC1_placeholder", "pake_placeholder", meta={})
+                        except Exception:
+                            pass
+                    db.update_presence(user_id, "online")
+                    # Add to public channel and announce
+                    db.add_member_to_public(user_id)
+                    add_payload = {"add": [db.get_display_name(user_id)], "if_version": 1}
+                    # Fan-out to peer servers
+                    for to_server_id, server_ws in tables.servers.items():
+                        await server_ws.send(make_envelope(
+                            msg_type=ServerMessageType.PUBLIC_CHANNEL_ADD,
+                            from_id=SERVER_ID,
+                            to_id=to_server_id,
+                            payload=add_payload,
+                            sig=sign_transport_payload(add_payload, _SERVER_PRIV_DER)
+                        ))
+                    ack_payload = {"msg_ref": "USER_HELLO_OK", "server_pub": SERVER_PUB_B64}
+                    await ws.send(make_envelope(
+                        msg_type="ACK",
+                        from_id=SERVER_ID,
                         to_id=user_id,
-                        payload={"msg_ref": "USER_HELLO_OK"}
+                        payload=ack_payload,
+                        sig=sign_transport_payload(ack_payload, _SERVER_PRIV_DER)
                     ))
 
-
-                    # USER ADVERTISE
+                    # USER_ADVERTISE (stub fanout)
                     for target_server, server_ws in tables.servers.items():
-                        await server_ws.send(protocol.make_envelope(
+                        await server_ws.send(make_envelope(
                             msg_type=ServerMessageType.USER_ADVERTISE,
                             from_id=SERVER_ID,
                             to_id=target_server,
-                            payload={
-                                "user_id": user_id,
-                                "server_id": SERVER_ID,
-                                "meta": {}   # TODO: attach username here
-                            },
-                            sig="..."  # TODO: sig
+                            payload={"user_id": user_id, "server_id": SERVER_ID, "meta": {}}
                         ))
 
-
-                    # PUBLIC CHANNEL JOIN
-                    # TODO: give user wrapped copy here
-                    for target_server, server_ws in tables.servers.items():
-                        await server_ws.send(protocol.make_envelope(
-                            msg_type=ServerMessageType.PUBLIC_CHANNEL_ADD,
-                            from_id=SERVER_ID,
-                            to_id=target_server,
-                            payload={
-                                "add": [db.get_name(user_id)],
-                                "if_version":  1
-                            }
-                        ))
-
-
-                     # PUBLIC CHANNEL UPDATED 
-                     # TODO: also reused this part when USER_REMOVE
-                    for target_server, server_ws in tables.servers.items():
-                        await server_ws.send(protocol.make_envelope(
-                            msg_type=ServerMessageType.PUBLIC_CHANNEL_UPDATED,
-                            from_id=SERVER_ID,
-                            to_id=target_server,
-                            payload={
-                                "version": 2,  # TODO: configure version
-                                "wraps":[
-                                    {
-                                        "member_id": "id",
-                                        "wrapped_key": "..." # TODO: configure this
-                                    },
-                                    
-                                ]
-                            },
-                            sig="..."
-                        ))
-
-                    
-
-                    
-
-                    
-
-                    
-
-                    
-                
-            # Handle direct message 
             elif msg_type == "MSG_DIRECT":
                 sender = frame["from"]
                 recipient = frame["to"]
-
-
+                payload = frame.get("payload", {})
+                orig_ts = frame.get("ts")
 
                 if recipient in tables.local_users:
-                    # Deliver to local recipient
-                    payload = frame["payload"]
                     new_payload = {
-                        "ciphertext": payload["ciphertext"],
+                        "ciphertext": payload.get("ciphertext", ""),
                         "sender": sender,
-                        "sender_pub": payload["sender_pub"],
-                        "content_sig": payload["content_sig"]
+                        "sender_pub": payload.get("sender_pub", ""),
+                        "content_sig": payload.get("content_sig", "")
                     }
-
-                    await tables.local_users[recipient].send(protocol.make_envelope(
-                        msg_type="USER_DELIVER", 
-                        from_id=SERVER_ID, 
-                        to_id=recipient, 
+                    await tables.local_users[recipient].send(make_envelope(
+                        msg_type="USER_DELIVER",
+                        from_id=SERVER_ID,
+                        to_id=recipient,
                         payload=new_payload,
-                        sig="<server_1 signature over payload>" # TODO: sig
+                        sig=sign_transport_payload(new_payload, _SERVER_PRIV_DER),
+                        ts=orig_ts
                     ))
-                    print(f"[SERVER] Delivered DM from {new_payload["sender"]} -> {recipient}")
-                
-                elif recipient in tables.user_locations and tables.user_locations != "local":
-                    # Wrap as SERVER_DELIVER here
+                elif recipient in tables.user_locations and tables.user_locations.get(recipient) != "local":
                     to_server_id = tables.user_locations[recipient]
-                    server_ws = tables.servers[to_server_id]                    
-                    payload = frame[payload]
-
-                    # Wrap for server delivery
-                    await server_ws.send(protocol.make_envelope(
+                    server_ws = tables.servers[to_server_id]
+                    srv_payload = {
+                            "user_id": recipient,
+                            "ciphertext": payload.get("ciphertext", ""),
+                            "sender": sender,
+                            "sender_pub": payload.get("sender_pub", ""),
+                            "content_sig": payload.get("content_sig", ""),
+                            "orig_ts": orig_ts
+                        }
+                    await server_ws.send(make_envelope(
                         msg_type=ServerMessageType.SERVER_DELIVER,
                         from_id=SERVER_ID,
                         to_id=to_server_id,
-                        payload={
-                            "user_id": recipient,
-                            "ciphertext": payload["ciphertext"],
-                            "sender": sender,
-                            "sender_pub": payload["sender_pub"],
-                            "content_sig": payload["content_sig"]
-                        },
-                        sig="<server_2 signature over payload>"
+                        payload=srv_payload,
+                        sig=sign_transport_payload(srv_payload, _SERVER_PRIV_DER)
                     ))
-                
                 else:
-                    # User not found
-                    await ws.send(protocol.make_envelope(
-                        msg_type="ERROR", 
-                        from_id=SERVER_ID, 
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
                         to_id=sender,
-                        payload= {
-                            "code": "USER_NOT_FOUND", 
-                            "detail": f"{recipient} not online"}
+                        payload={"code": "USER_NOT_FOUND", "detail": f"{recipient} not online"}
                     ))
-
-
-                    print("[SERVER] user not found notification")
 
             elif msg_type == ServerMessageType.MSG_PUBLIC_CHANNEL:
                 sender = frame["from"]
-                group_id = frame["to"]  # this should always be public
-                payload = frame["payload"]
+                group_id = frame["to"]
+                payload = frame.get("payload", {})
 
-
-
-                # fan to local members
-                member_ids = db.get_member_ids_of_group(group_id) # TODO: Get member id from data table of public group
-                for member_id in member_ids:
-                    if member_id == sender:
+                members = set(db.get_public_members())
+                for member_id in list(tables.local_users.keys()):
+                    if member_id == sender or member_id not in members:
                         continue
-                        
-                    if member_id in tables.local_users:
-                        await tables.local_users[member_id].send(protocol.make_envelope(
-                            msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL, 
-                            from_id=sender, 
-                            to_id=group_id, 
-                            payload=payload
-                        ))
+                    out_payload = payload
+                    await tables.local_users[member_id].send(make_envelope(
+                        msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
+                        from_id=sender,
+                        to_id=group_id,
+                        payload=out_payload,
+                        sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER)
+                    ))
 
-
-                # Only fan out to other servers if sender is local to avoid loop
-                # NOTE: current data dont include identifier of users across server
                 if sender in tables.local_users:
                     for to_server_id, server_ws in tables.servers.items():
                         if to_server_id != SERVER_ID:
-                            await server_ws.send(frame)
-          
-                    
+                            await server_ws.send(raw)
 
-
-
-                        
-            
-            # Handle route file request
             elif msg_type in ["FILE_START", "FILE_CHUNK", "FILE_END"]:
                 sender = frame["from"]
                 recipient = frame["to"]
 
                 if recipient in tables.local_users:
-                    await tables.local_users[recipient].send(protocol.make_envelope(
-                        msg_type=msg_type, 
-                        from_id=sender, 
-                        to_id=recipient, 
-                        payload=frame["payload"]
+                    out_payload = frame.get("payload", {})
+                    await tables.local_users[recipient].send(make_envelope(
+                        msg_type=msg_type,
+                        from_id=sender,
+                        to_id=recipient,
+                        payload=out_payload,
+                        sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER)
                     ))
-                    print(f"[SERVER] Delivered {msg_type} from {sender} -> {recipient}")
-                
-                elif recipient in tables.user_locations and tables.user_locations != "local":
-                    # forward directly to other server
-                    # NOTE: DO we need to wrap in SERVER_DELIVER???
-                    await tables.user_locations[recipient].send(frame)
-
+                elif recipient in tables.user_locations and tables.user_locations.get(recipient) != "local":
+                    # Forward (no wrap)
+                    to_server_id = tables.user_locations[recipient]
+                    await tables.servers[to_server_id].send(raw)
                 else:
-                    await ws.send(protocol.make_envelope(
-                        msg_type="ERROR", 
-                        from_id=SERVER_ID, 
+                    err_payload = {"code": "USER_NOT_FOUND", "detail": f"{recipient} not online"}
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
                         to_id=sender,
-                        payload= {
-                            "code": "USER_NOT_FOUND", 
-                            "detail": f"{recipient} not online"}
+                        payload=err_payload,
+                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER)
                     ))
 
             elif msg_type == CustomisedMessageType.LIST_REQUEST:
                 sender = frame["from"]
-
-                await ws.send(protocol.make_envelope(
+                list_payload = {"online_users": sorted(tables.user_locations.keys())}
+                await ws.send(make_envelope(
                     msg_type=CustomisedMessageType.LIST_RESPONSE,
                     from_id=SERVER_ID,
                     to_id=sender,
-                    payload={
-                        "online_users": sorted(tables.user_locations.keys())
-                    }
+                    payload=list_payload,
+                    sig=sign_transport_payload(list_payload, _SERVER_PRIV_DER)
+                ))
+            elif msg_type == ServerMessageType.PUBLIC_CHANNEL_ADD:
+                add = frame.get("payload", {}).get("add", [])
+                print(f"[SERVER] PUBLIC_CHANNEL_ADD: {add}")
+            elif msg_type == ServerMessageType.PUBLIC_CHANNEL_UPDATED:
+                remove = frame.get("payload", {}).get("remove", [])
+                print(f"[SERVER] PUBLIC_CHANNEL_UPDATED remove: {remove}")
+            elif msg_type == "PUBKEY_REQUEST":
+                # Return recipient's pubkey for E2EE
+                target = frame.get("payload", {}).get("user_id")
+                pub = db.get_pubkey(target) if target else None
+                resp_payload = {"user_id": target, "pubkey": pub}
+                await ws.send(make_envelope(
+                    msg_type="PUBKEY_RESPONSE",
+                    from_id=SERVER_ID,
+                    to_id=frame.get("from"),
+                    payload=resp_payload,
+                    sig=sign_transport_payload(resp_payload, _SERVER_PRIV_DER)
                 ))
             else:
-                print(f"[SERVER] Unhandled message: {frame}")
+                # ignore unknown
+                pass
 
-    except (websockets.exceptions.ConnectionClosedOK, 
-            websockets.exceptions.ConnectionClosedError):
-        print(f"[SERVER] Connection closed for {user_id}")
-
+    except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError):
+        pass
     finally:
-        print(f"[SERVER] Connection closed for {user_id}")
-        tables.local_users.pop(user_id)
-        tables.user_locations.pop(user_id)
-
-        # TODO: USER_REMOVE broadcast
-
-
-
+        if user_id:
+            tables.local_users.pop(user_id, None)
+            tables.user_locations.pop(user_id, None)
+            db.update_presence(user_id, "offline")
+            # Remove from public channel and announce removal
+            db.remove_member_from_public(user_id)
+            # USER_REMOVE gossip
+            rm_payload = {"user_id": user_id}
+            for to_server_id, server_ws in tables.servers.items():
+                await server_ws.send(make_envelope(
+                    msg_type=ServerMessageType.USER_ADVERTISE if False else "USER_REMOVE",
+                    from_id=SERVER_ID,
+                    to_id=to_server_id,
+                    payload=rm_payload,
+                    sig=sign_transport_payload(rm_payload, _SERVER_PRIV_DER)
+                ))
+            # PUBLIC_CHANNEL_UPDATED remove notice
+            upd_payload = {"remove": [db.get_display_name(user_id)], "if_version": 1}
+            for to_server_id, server_ws in tables.servers.items():
+                await server_ws.send(make_envelope(
+                    msg_type=ServerMessageType.PUBLIC_CHANNEL_UPDATED,
+                    from_id=SERVER_ID,
+                    to_id=to_server_id,
+                    payload=upd_payload,
+                    sig=sign_transport_payload(upd_payload, _SERVER_PRIV_DER)
+                ))
 
 
 async def start_server(host="localhost", port=8765):
-    print(f"[SERVER] Starting on ws://{host}:{port}")
-    async with websockets.serve(handle_client, host, port):
-        await asyncio.Future()  # run forever
+    async with websockets.serve(handle_client, host, port, ping_interval=15, ping_timeout=45):
+        # periodic status print (like Ammar's core)
+        async def status_loop():
+            while True:
+                await asyncio.sleep(20)
+                print(f"Known users: {list(tables.user_locations.keys())}")
+                print(f"Known servers: {list(tables.servers.keys())}")
+        await status_loop()
 
 

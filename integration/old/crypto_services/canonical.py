@@ -35,5 +35,3 @@ def preimage_keyshare(shares_payload: List[dict], creator_pub_b64url: str) -> by
         shares_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return s + _to_bytes(creator_pub_b64url)
-
-

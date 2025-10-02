@@ -1,109 +1,115 @@
-
 import asyncio
 import base64
 import pathlib
-from crypto_services.base64url import b64url_decode, b64url_encode
-from crypto_services.canonical import preimage_dm
-from crypto_services.rsa import decrypt_rsa_oaep, encrypt_rsa_oaep, generate_rsa4096_keypair, sign_pss_sha256, verify_pss_sha256
 import websockets
 import uuid
-import protocol
 import os
 
+from .protocol import make_envelope, parse_envelope
+from .customised_types import ServerMessageType, CustomisedMessageType
+from .crypto_services import (
+    b64url_encode, b64url_decode,
+    generate_rsa4096_keypair, private_key_to_der, public_key_to_b64url,
+    encrypt_rsa_oaep, decrypt_rsa_oaep,
+    sign_pss_sha256, verify_pss_sha256,
+    load_public_key_b64url, load_private_key_der,
+    preimage_dm, preimage_public,
+)
+from .transport import verify_transport_payload
 
-
-from customised_types import ServerMessageType, CustomisedMessageType
 
 DM_COMMAND = "/tell "
 FILE_COMMAND = "/file "
 LIST_COMMAND = "/list"
 CLOSE_COMMAND = "/quit"
 PUBLIC_COMMAND = "/all "
-CHUNK_SIZE=4096
+CHUNK_SIZE = 4096
 
 
-# TODO: make private/public key an attribute
-# storing in encoded, decode when fetching 
-
-
-
-private_key, public_key = "", ""
-    
-
-
-class Client():
-
+class Client:
     def __init__(self):
-        self.__private_key, self.public_key = generate_rsa4096_keypair()
+        priv, pub = generate_rsa4096_keypair()
+        self._priv_der = private_key_to_der(priv)
+        self._priv = priv
+        self._pub_b64 = public_key_to_b64url(pub)
+        self._server_pub = None
+        self._peer_pub_cache = {}
+        self._pending_pubkey = {}
+
+    async def _ensure_peer_pub(self, ws, user_id):
+        if user_id in self._peer_pub_cache:
+            return self._peer_pub_cache[user_id]
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        self._pending_pubkey[user_id] = fut
+        req = make_envelope(
+            msg_type="PUBKEY_REQUEST",
+            from_id=self._user_id,
+            to_id="server-1",
+            payload={"user_id": user_id}
+        )
+        await ws.send(req)
+        try:
+            pub = await fut
+            if pub:
+                self._peer_pub_cache[user_id] = pub
+            return pub
+        finally:
+            self._pending_pubkey.pop(user_id, None)
 
     async def sender(self, ws, user_id):
+        self._user_id = user_id
         loop = asyncio.get_event_loop()
         while True:
             cmd = await loop.run_in_executor(None, input)
-            
-            
-            # Direct messaging 
-            if cmd.startswith(DM_COMMAND):
 
+            if cmd.startswith(DM_COMMAND):
                 try:
                     _, target, msg = cmd.split(" ", maxsplit=2)
                 except ValueError:
                     print("[CLIENT] Usage: /tell <user_id> <message>")
                     continue
 
-                receiver_public = ""
-                sender_public = ""
-                sender_private = ""
-
-                # ciphertext = encrypt_rsa_oaep(msg, receiver_public)
-                # ciphertext = b64url_encode(ciphertext)
-
-                # content_sig = sign_pss_sha256(ciphertext, sender_private)
-
-
-                # msg = msg.encode("utf-8")
-                # ciphertext = encrypt_rsa_oaep(msg, receiver_public)
-                # ciphertext = b64url_encode(ciphertext)
-                # pm_msg = preimage_dm(ciphertext, "1" ,"2", 1759388690830)
-
-                # content_sig = sign_pss_sha256(pm_msg, sender_private)
-
-                # DM plaintext 
-                dm = protocol.make_envelope(
-                    msg_type="MSG_DIRECT", 
-                    from_id=user_id, 
-                    to_id=target, 
+                peer_pub_b64 = await self._ensure_peer_pub(ws, target)
+                if not peer_pub_b64:
+                    print(f"[CLIENT] No pubkey for {target}")
+                    continue
+                peer_pub = load_public_key_b64url(peer_pub_b64)
+                plaintext = msg.encode("utf-8")
+                ciphertext = b64url_encode(encrypt_rsa_oaep(plaintext, peer_pub))
+                import time as _t
+                ts_ms = int(_t.time() * 1000)
+                pm = preimage_dm(ciphertext, user_id, target, ts_ms)
+                content_sig = b64url_encode(sign_pss_sha256(pm, self._priv))
+                dm = make_envelope(
+                    msg_type="MSG_DIRECT",
+                    from_id=user_id,
+                    to_id=target,
                     payload={
-                        "ciphertext": msg,
-                        "sender_pub": "sender_pub",
-                        "content_sig": "content_sig"
+                        "ciphertext": ciphertext,
+                        "sender_pub": self._pub_b64,
+                        "content_sig": content_sig
                     },
-                    sig="")
+                    sig="",
+                    ts=ts_ms
+                )
                 await ws.send(dm)
 
-            
-
-            # File transfer
             elif cmd.startswith(FILE_COMMAND):
                 try:
                     _, target, filepath = cmd.split(" ", 2)
                 except ValueError:
                     print("[CLIENT] Usage: /file <user_id> <path>")
                     continue
-                
 
                 if not os.path.exists(filepath):
                     print(f"[CLIENT] File not found: {filepath}")
                     continue
-                    
-                
-                # Get file metadata 
+
                 file_id = str(uuid.uuid4())
                 size = os.path.getsize(filepath)
                 name = os.path.basename(filepath)
 
-
-                # FILE_START
                 manifest = {
                     "file_id": file_id,
                     "name": name,
@@ -112,197 +118,149 @@ class Client():
                     "mode": "dm"
                 }
 
+                await ws.send(make_envelope(
+                    msg_type="FILE_START",
+                    from_id=user_id,
+                    to_id=target,
+                    payload=manifest
+                ))
 
-                await ws.send(protocol.make_envelope(
-                    msg_type="FILE_START", 
-                    from_id=user_id, 
-                    to_id=target, 
-                    payload=manifest))
-                
-
-                print(f"[CLIENT:{user_id}] Started sending file {name}")
-
-                # FILE_CHUNK (simple base64 encoding)
                 with open(filepath, "rb") as f:
                     idx = 0
                     while chunk := f.read(CHUNK_SIZE):
+                        b64 = base64.urlsafe_b64encode(chunk).decode().rstrip("=")
                         frame = {
                             "file_id": file_id,
                             "index": idx,
-                            "ciphertext": b64url_encode(chunk)
+                            "ciphertext": b64
                         }
-                        await ws.send(protocol.make_envelope(
-                            msg_type="FILE_CHUNK", 
-                            from_id=user_id, 
-                            to_id=target, 
+                        await ws.send(make_envelope(
+                            msg_type="FILE_CHUNK",
+                            from_id=user_id,
+                            to_id=target,
                             payload=frame,
-                            sig=""))
-                        
+                            sig=""
+                        ))
                         idx += 1
 
-                # FILE_END
-                await ws.send(protocol.make_envelope(
-                    msg_type="FILE_END", 
-                    from_id=user_id, 
-                    to_id=target, 
+                await ws.send(make_envelope(
+                    msg_type="FILE_END",
+                    from_id=user_id,
+                    to_id=target,
                     payload={"file_id": file_id},
-                    sig=""))
-                
+                    sig=""
+                ))
 
-                print(f"[CLIENT:{user_id}] Finished sending file {name}")
-            
-            # PUBLIC CHANNEL CHAT 
             elif cmd.startswith(PUBLIC_COMMAND):
-                try:
-                    text = cmd[len(PUBLIC_COMMAND):]
-                except ValueError:
-                    print("[CLIENT] Usage: /all <text>")
-                    continue
-
-
-                msg_public = protocol.make_envelope(
+                text = cmd[len(PUBLIC_COMMAND):]
+                # For public, we still E2E encrypt to per-member wrapped key; here placeholder encrypt to string
+                ciphertext = b64url_encode(text.encode('utf-8'))
+                pm = preimage_public(ciphertext, user_id, 0)
+                content_sig = b64url_encode(sign_pss_sha256(pm, self._priv))
+                msg_public = make_envelope(
                     msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
                     from_id=user_id,
                     to_id="public",
                     payload={
-                        "ciphertext": text,
-                        "sender_pub": "demo_pub",
-                        "content_sig": "demo_sig"
+                        "ciphertext": ciphertext,
+                        "sender_pub": self._pub_b64,
+                        "content_sig": content_sig
                     },
                     sig=""
                 )
-
                 await ws.send(msg_public)
 
-
             elif cmd.startswith(LIST_COMMAND):
-                lst_msg = protocol.make_envelope(
+                lst_msg = make_envelope(
                     msg_type="LIST_REQUEST",
                     from_id=user_id,
                     to_id="server-1",
                     payload={}
                 )
-
                 await ws.send(lst_msg)
 
-
-
-            # GRACEFUL DISCONNECT REQUEST
             elif cmd.startswith(CLOSE_COMMAND):
-                ctrl = protocol.make_envelope(
-                    msg_type="CTRL_CLOSE", 
-                    from_id=user_id, 
-                    to_id="server-1", 
-                    payload={})
+                ctrl = make_envelope(
+                    msg_type="CTRL_CLOSE",
+                    from_id=user_id,
+                    to_id="server-1",
+                    payload={}
+                )
                 await ws.send(ctrl)
                 await ws.close(code=1000)
                 print(f"[CLIENT:{user_id}] Disconnected")
                 return
 
-
-
-
-
-
     async def receiver(self, ws):
-
         files_in_progress = {}
-
-
         async for raw in ws:
-            frame = protocol.parse_envelope(raw)
-            if frame["type"] == "USER_DELIVER":
-                print(f"DM from {frame['payload'].get('sender')}: {frame['payload'].get('ciphertext')}")
-
-                ciphertext = frame["payload"].get("ciphertext")
-                sender_pub = frame["payload"].get("sender_pub")
-                content_sig = frame["payload"].get("content_sig")
-
-                private_key = "" # TODO: fetch from database
-
-
-                # pm_rec = preimage_dm(ciphertext, "1", "2", 1759388690830)
-                # # verify content  
-                # if verify_pss_sha256(pm_rec, content_sig, sender_pub):
-
-                #     # decode and decrypt
-                #     plaintext = decrypt_rsa_oaep(b64url_decode(ciphertext), private_key)
-                #     text = plaintext.decode('utf-8')
-
-                #     print(f"Decrypted: {text}")
-
-
-                # # verify content  
-                # if verify_pss_sha256(ciphertext, content_sig, sender_pub):
-
-                #     # decode and decrypt
-                #     plaintext = decrypt_rsa_oaep(b64url_decode(ciphertext), private_key)
-                    
-                #     print(f"DM from {frame['payload'].get('sender')}: {plaintext}")
-
-            
-            
-
+            frame = parse_envelope(raw)
+            if not frame:
+                continue
+            if frame["type"] == "ACK":
+                payload = frame.get("payload", {})
+                self._server_pub = payload.get("server_pub") or self._server_pub
+            elif frame["type"] == "USER_DELIVER":
+                payload = frame.get("payload", {})
+                if self._server_pub and not verify_transport_payload(payload, frame.get("sig", ""), self._server_pub):
+                    print("[ERROR] INVALID transport signature from server")
+                    continue
+                sender_pub_b64 = payload.get("sender_pub")
+                ciphertext = payload.get("ciphertext", "")
+                pm = preimage_dm(ciphertext, payload.get("sender"), self._user_id, frame.get("ts") or 0)
+                if not sender_pub_b64 or not verify_pss_sha256(pm, b64url_decode(payload.get("content_sig", "")), load_public_key_b64url(sender_pub_b64)):
+                    print("[ERROR] INVALID content signature")
+                    continue
+                try:
+                    pt = decrypt_rsa_oaep(b64url_decode(ciphertext), self._priv)
+                    print(f"DM from {payload.get('sender')}: {pt.decode('utf-8', errors='replace')}")
+                except Exception:
+                    print("[ERROR] Decrypt failed")
             elif frame["type"] == ServerMessageType.MSG_PUBLIC_CHANNEL:
-                print(f"[Public] {frame['payload'].get('ciphertext')}")
-            
+                payload = frame.get("payload", {})
+                print(f"[Public] {payload.get('ciphertext')}")
+            elif frame["type"] == "PUBKEY_RESPONSE":
+                payload = frame.get("payload", {})
+                uid = payload.get("user_id")
+                pub = payload.get("pubkey")
+                fut = self._pending_pubkey.get(uid)
+                if fut and not fut.done():
+                    fut.set_result(pub)
             elif frame["type"] == "FILE_START":
-                payload = frame["payload"]
+                payload = frame.get("payload", {})
                 print(f"Receiving file {payload['name']} ({payload['size']} bytes)")
                 files_in_progress[payload["file_id"]] = []
-
             elif frame["type"] == "FILE_CHUNK":
-
-                # insert at index
-                chunk = frame["payload"]
+                chunk = frame.get("payload", {})
                 idx = int(chunk["index"])
-                files_in_progress[chunk["file_id"]].insert(idx, base64.b64decode(chunk["ciphertext"]))
-
+                files_in_progress[chunk["file_id"]].insert(idx, base64.urlsafe_b64decode(chunk["ciphertext"] + "=="))
             elif frame["type"] == "FILE_END":
-                fid = frame["payload"]["file_id"]
+                fid = frame.get("payload", {}).get("file_id")
                 data = b"".join(files_in_progress[fid])
                 outpath = pathlib.Path(f"received_file_{fid}")
                 outpath.write_bytes(data)
                 print(f"File received and saved to {outpath}")
                 del files_in_progress[fid]
-            
             elif frame["type"] == CustomisedMessageType.LIST_RESPONSE:
-                online_users = frame["payload"]["online_users"]
-
+                online_users = frame.get("payload", {}).get("online_users")
                 print(f"Online users: {online_users}")
-            
             elif frame["type"] == "ERROR":
-                print(f"[ERROR] {frame["payload"]}")
-            else:
-                pass
-
-        
-
-
-
+                print(f"[ERROR] {frame.get('payload')}")
 
     async def run_client(self, user_id=None, host="localhost", port=8765):
         if not user_id:
-            user_id = str(uuid.uuid4())  # User UUIDv4
+            user_id = str(uuid.uuid4())
         uri = f"ws://{host}:{port}"
-
-        # private_key, public_key = generate_rsa4096_keypair()
-
-
-
         async with websockets.connect(uri) as ws:
             print(f"[CLIENT:{user_id}] Connected to {uri}")
-
-            # Send USER_HELLO
-            hello = protocol.make_envelope(
+            hello = make_envelope(
                 "USER_HELLO",
                 from_id=user_id,
                 to_id="server-1",
-                payload={"client": "cli-v1", "pubkey": "demo-pub", "enc_pubkey": "demo-pub"},
+                payload={"client": "cli-v1", "pubkey": self._pub_b64, "enc_pubkey": self._pub_b64},
                 sig=""
             )
             await ws.send(hello)
-
-            # TODO: retry mechanism
-
             await asyncio.gather(self.sender(ws, user_id), self.receiver(ws))
+
+

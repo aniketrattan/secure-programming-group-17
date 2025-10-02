@@ -13,5 +13,3 @@ class ServerMessageType(str, Enum):
 class CustomisedMessageType(str, Enum):
     LIST_REQUEST = "LIST_REQUEST"
     LIST_RESPONSE = "LIST_RESPONSE"
-
-
