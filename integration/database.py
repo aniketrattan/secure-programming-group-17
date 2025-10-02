@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 import uuid
+from .crypto_services.rsa import load_public_key_b64url
 
 
 # Configure logging
@@ -77,6 +78,8 @@ class SecureMessagingDB:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Ensure required columns exist if the table pre-dates this schema
+            self._migrate_users_table(conn)
             
             # group_id table SOCP 15.1
             # Public channel has group_id="public" and creator_id="system"
@@ -141,6 +144,21 @@ class SecureMessagingDB:
             logger.info("Database initialized successfully (SOCP v1.3 compliant)")
         # Ensure existence after closing prior write transaction to avoid locks
         self.ensure_public_channel_exists()
+
+    def _migrate_users_table(self, conn):
+        cols = {row[1] for row in conn.execute("PRAGMA table_info('users')").fetchall()}
+        altered = False
+        if 'privkey_store' not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN privkey_store TEXT NOT NULL DEFAULT ''")
+            altered = True
+        if 'pake_password' not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN pake_password TEXT NOT NULL DEFAULT ''")
+            altered = True
+        if 'version' not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            altered = True
+        if altered:
+            conn.execute("UPDATE users SET updated_at=CURRENT_TIMESTAMP")
     
     def _initialize_public_channel(self, conn):
         """ADDED: Initialize the required public channel per SOCP spec."""
@@ -221,22 +239,40 @@ class SecureMessagingDB:
     def register_user(self, user_id: str, pubkey: str, privkey_store: str,
                      pake_password: str, meta: Optional[Dict] = None) -> str:
         meta_json = json.dumps(meta) if meta else None
-        
+        # Enforce RSA-4096 public key
+        try:
+            load_public_key_b64url(pubkey)
+        except Exception as exc:
+            raise ValueError("Invalid RSA-4096 public key") from exc
+
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("BEGIN TRANSACTION")
-                conn.execute("""
+                # Insert or update with version bump on replace
+                conn.execute(
+                    """
                     INSERT INTO users (user_id, pubkey, privkey_store, pake_password, meta, version)
                     VALUES (?, ?, ?, ?, ?, 1)
-                """, (user_id, pubkey, privkey_store, pake_password, meta_json))
-                
-                wrapped_key = f"wrapped_key_for_{user_id}"  # TODO - RSA-OAEP encrypted channel key
-                
-                conn.execute("""
-                    INSERT INTO group_members (group_id, member_id, role, wrapped_key, added_at)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        pubkey=excluded.pubkey,
+                        privkey_store=excluded.privkey_store,
+                        pake_password=excluded.pake_password,
+                        meta=excluded.meta,
+                        version=users.version + 1,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (user_id, pubkey, privkey_store, pake_password, meta_json),
+                )
+
+                wrapped_key = f"wrapped_key_for_{user_id}"  # Placeholder for RSA-OAEP wrapped channel key
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO group_members (group_id, member_id, role, wrapped_key, added_at)
                     VALUES ('public', ?, 'member', ?, ?)
-                """, (user_id, wrapped_key, int(datetime.now(timezone.utc).timestamp())))
-                
+                    """,
+                    (user_id, wrapped_key, int(datetime.now(timezone.utc).timestamp())),
+                )
+
                 conn.commit()
                 logger.info(f"User registered successfully: {user_id}")
                 return user_id
@@ -245,24 +281,24 @@ class SecureMessagingDB:
             logger.error(f"Failed to register user {user_id}: {e}")
             raise ValueError(f"User ID {user_id} already exists")
     
-    def authenticate_user(self, user_id: str, password: str) -> Optional[str]:
+    def get_user_auth(self, user_id: str) -> Optional[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("""
-                SELECT user_id, pake_password 
-                FROM users 
-                WHERE user_id = ?
-            """, (user_id,)).fetchone()
-            
+            row = conn.execute(
+                """
+                SELECT pubkey, privkey_store, pake_password, version
+                FROM users
+                WHERE user_id=?
+                """,
+                (user_id,),
+            ).fetchone()
             if not row:
                 return None
-            
-            stored_user_id, stored_verifier = row
-            
-            # In production: perform PAKE verification here
-            # For now, simplified check
-            session_id = self.create_session(stored_user_id)
-            print(f"Session ID: session_id")
-            return stored_user_id
+            return {
+                "pubkey": row[0],
+                "privkey_store": row[1],
+                "pake_password": row[2],
+                "version": row[3],
+            }
     
     def get_pubkey(self, user_id: str) -> Optional[str]:
         with sqlite3.connect(self.db_path) as conn:
@@ -464,6 +500,21 @@ class SecureMessagingDB:
             
             conn.commit()
             return row[0] if row else 0
+
+    def set_user_version(self, user_id: str, version: int) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE users SET version=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?
+                """,
+                (version, user_id),
+            )
+            row = conn.execute("SELECT version FROM users WHERE user_id=?", (user_id,)).fetchone()
+            conn.commit()
+            return row[0] if row else 0
+
+    def bump_user_version(self, user_id: str) -> int:
+        return self.update_user_version(user_id)
     
     def update_group_version(self, group_id: str) -> int:
         """Increment group version (for member changes/key rotation)"""

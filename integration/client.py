@@ -6,7 +6,7 @@ import uuid
 import os
 
 from .protocol import make_envelope, parse_envelope
-from .customised_types import ServerMessageType, CustomisedMessageType
+from .customised_types import ServerMessageType, CustomisedMessageType, UserAuthType
 from .crypto_services import (
     b64url_encode, b64url_decode,
     generate_rsa4096_keypair, private_key_to_der, public_key_to_b64url,
@@ -16,6 +16,7 @@ from .crypto_services import (
     preimage_dm, preimage_public,
 )
 from .transport import verify_transport_payload
+from .crypto_services.secure_store import get_password_hasher, protect_private_key, recover_private_key
 
 
 DM_COMMAND = "/tell "
@@ -24,10 +25,13 @@ LIST_COMMAND = "/list"
 CLOSE_COMMAND = "/quit"
 PUBLIC_COMMAND = "/all "
 CHUNK_SIZE = 4096
+REGISTER_COMMAND = "/register"
+LOGIN_COMMAND = "/login "
 
 
 class Client:
     def __init__(self):
+        # Keys are set after login; generate ephemeral defaults
         priv, pub = generate_rsa4096_keypair()
         self._priv_der = private_key_to_der(priv)
         self._priv = priv
@@ -35,6 +39,8 @@ class Client:
         self._server_pub = None
         self._peer_pub_cache = {}
         self._pending_pubkey = {}
+        self._user_id = None
+        self._login_future = None
 
     async def _ensure_peer_pub(self, ws, user_id):
         if user_id in self._peer_pub_cache:
@@ -57,17 +63,86 @@ class Client:
         finally:
             self._pending_pubkey.pop(user_id, None)
 
-    async def sender(self, ws, user_id):
-        self._user_id = user_id
+    async def sender(self, ws):
         loop = asyncio.get_event_loop()
         while True:
             cmd = await loop.run_in_executor(None, input)
+
+            if cmd.startswith(REGISTER_COMMAND):
+                uid = input("Choose user_id: ")
+                password = input("Create password: ")
+                # Generate keys and protect private key
+                priv, pub = generate_rsa4096_keypair()
+                priv_der = private_key_to_der(priv)
+                enc_blob = protect_private_key(priv_der, password)
+                ph = get_password_hasher()
+                salted_hash = ph.hash(password)
+                msg = make_envelope(
+                    msg_type=UserAuthType.REGISTER,
+                    from_id=uid,
+                    to_id="server-1",
+                    payload={
+                        "pubkey": public_key_to_b64url(pub),
+                        "privkey_store": b64url_encode(enc_blob),
+                        "pake_password": salted_hash,
+                    },
+                    sig="",
+                )
+                await ws.send(msg)
+                print(f"[REGISTER] Sent register request for {uid}")
+
+            elif cmd.startswith(LOGIN_COMMAND):
+                uid = cmd[len(LOGIN_COMMAND):].strip()
+                if not uid:
+                    print("[CLIENT] Usage: /login <user_id>")
+                    continue
+                password = input("Enter password: ")
+                # Prepare waiter
+                loop = asyncio.get_event_loop()
+                fut = loop.create_future()
+                self._login_future = fut
+                req = make_envelope(
+                    msg_type=UserAuthType.LOGIN_REQUEST,
+                    from_id=uid,
+                    to_id="server-1",
+                    payload={"password": password},
+                )
+                await ws.send(req)
+                # Wait for result
+                resp = await fut
+                if resp["type"] == UserAuthType.LOGIN_SUCCESS:
+                    payload = resp.get("payload", {})
+                    self._user_id = uid
+                    self._pub_b64 = payload.get("pubkey", self._pub_b64)
+                    enc = b64url_decode(payload.get("privkey_store", ""))
+                    try:
+                        der_priv = recover_private_key(enc, password)
+                        self._priv_der = der_priv
+                        self._priv = load_private_key_der(der_priv)
+                    except Exception:
+                        print("[CLIENT] Failed to recover private key")
+                        continue
+                    # Send USER_HELLO after login
+                    hello = make_envelope(
+                        "USER_HELLO",
+                        from_id=self._user_id,
+                        to_id="server-1",
+                        payload={"client": "cli-v1", "pubkey": self._pub_b64, "enc_pubkey": self._pub_b64},
+                        sig="",
+                    )
+                    await ws.send(hello)
+                    print(f"[LOGIN SUCCESS] {uid}")
+                else:
+                    print(f"[LOGIN FAILED] {uid}: {resp.get('payload')}")
 
             if cmd.startswith(DM_COMMAND):
                 try:
                     _, target, msg = cmd.split(" ", maxsplit=2)
                 except ValueError:
                     print("[CLIENT] Usage: /tell <user_id> <message>")
+                    continue
+                if not self._user_id:
+                    print("[CLIENT] Please /login first")
                     continue
 
                 peer_pub_b64 = await self._ensure_peer_pub(ws, target)
@@ -79,11 +154,11 @@ class Client:
                 ciphertext = b64url_encode(encrypt_rsa_oaep(plaintext, peer_pub))
                 import time as _t
                 ts_ms = int(_t.time() * 1000)
-                pm = preimage_dm(ciphertext, user_id, target, ts_ms)
+                pm = preimage_dm(ciphertext, self._user_id, target, ts_ms)
                 content_sig = b64url_encode(sign_pss_sha256(pm, self._priv))
                 dm = make_envelope(
                     msg_type="MSG_DIRECT",
-                    from_id=user_id,
+                    from_id=self._user_id,
                     to_id=target,
                     payload={
                         "ciphertext": ciphertext,
@@ -100,6 +175,9 @@ class Client:
                     _, target, filepath = cmd.split(" ", 2)
                 except ValueError:
                     print("[CLIENT] Usage: /file <user_id> <path>")
+                    continue
+                if not self._user_id:
+                    print("[CLIENT] Please /login first")
                     continue
 
                 if not os.path.exists(filepath):
@@ -120,7 +198,7 @@ class Client:
 
                 await ws.send(make_envelope(
                     msg_type="FILE_START",
-                    from_id=user_id,
+                    from_id=self._user_id,
                     to_id=target,
                     payload=manifest
                 ))
@@ -136,7 +214,7 @@ class Client:
                         }
                         await ws.send(make_envelope(
                             msg_type="FILE_CHUNK",
-                            from_id=user_id,
+                            from_id=self._user_id,
                             to_id=target,
                             payload=frame,
                             sig=""
@@ -145,7 +223,7 @@ class Client:
 
                 await ws.send(make_envelope(
                     msg_type="FILE_END",
-                    from_id=user_id,
+                    from_id=self._user_id,
                     to_id=target,
                     payload={"file_id": file_id},
                     sig=""
@@ -155,11 +233,14 @@ class Client:
                 text = cmd[len(PUBLIC_COMMAND):]
                 # For public, we still E2E encrypt to per-member wrapped key; here placeholder encrypt to string
                 ciphertext = b64url_encode(text.encode('utf-8'))
-                pm = preimage_public(ciphertext, user_id, 0)
+                if not self._user_id:
+                    print("[CLIENT] Please /login first")
+                    continue
+                pm = preimage_public(ciphertext, self._user_id, 0)
                 content_sig = b64url_encode(sign_pss_sha256(pm, self._priv))
                 msg_public = make_envelope(
                     msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
-                    from_id=user_id,
+                    from_id=self._user_id,
                     to_id="public",
                     payload={
                         "ciphertext": ciphertext,
@@ -173,7 +254,7 @@ class Client:
             elif cmd.startswith(LIST_COMMAND):
                 lst_msg = make_envelope(
                     msg_type="LIST_REQUEST",
-                    from_id=user_id,
+                    from_id=self._user_id or "",
                     to_id="server-1",
                     payload={}
                 )
@@ -182,13 +263,13 @@ class Client:
             elif cmd.startswith(CLOSE_COMMAND):
                 ctrl = make_envelope(
                     msg_type="CTRL_CLOSE",
-                    from_id=user_id,
+                    from_id=self._user_id or "",
                     to_id="server-1",
                     payload={}
                 )
                 await ws.send(ctrl)
                 await ws.close(code=1000)
-                print(f"[CLIENT:{user_id}] Disconnected")
+                print(f"[CLIENT:{self._user_id}] Disconnected")
                 return
 
     async def receiver(self, ws):
@@ -200,6 +281,10 @@ class Client:
             if frame["type"] == "ACK":
                 payload = frame.get("payload", {})
                 self._server_pub = payload.get("server_pub") or self._server_pub
+            elif frame["type"] in [UserAuthType.LOGIN_SUCCESS, UserAuthType.LOGIN_FAIL]:
+                if self._login_future and not self._login_future.done():
+                    self._login_future.set_result(frame)
+                    self._login_future = None
             elif frame["type"] == "USER_DELIVER":
                 payload = frame.get("payload", {})
                 if self._server_pub and not verify_transport_payload(payload, frame.get("sig", ""), self._server_pub):
@@ -248,19 +333,9 @@ class Client:
                 print(f"[ERROR] {frame.get('payload')}")
 
     async def run_client(self, user_id=None, host="localhost", port=8765):
-        if not user_id:
-            user_id = str(uuid.uuid4())
         uri = f"ws://{host}:{port}"
         async with websockets.connect(uri) as ws:
-            print(f"[CLIENT:{user_id}] Connected to {uri}")
-            hello = make_envelope(
-                "USER_HELLO",
-                from_id=user_id,
-                to_id="server-1",
-                payload={"client": "cli-v1", "pubkey": self._pub_b64, "enc_pubkey": self._pub_b64},
-                sig=""
-            )
-            await ws.send(hello)
-            await asyncio.gather(self.sender(ws, user_id), self.receiver(ws))
+            print(f"[CLIENT:{self._user_id}] Connected to {uri}")
+            await asyncio.gather(self.sender(ws), self.receiver(ws))
 
 

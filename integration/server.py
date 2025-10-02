@@ -5,14 +5,16 @@ import time
 
 from . import tables
 from .protocol import make_envelope, parse_envelope
-from .customised_types import ServerMessageType, CustomisedMessageType
+from .customised_types import ServerMessageType, CustomisedMessageType, UserAuthType
 from .database import SecureMessagingDB
 from .transport import generate_server_keys, sign_transport_payload
+from .crypto_services.secure_store import get_password_hasher
 
 
 SERVER_ID = "server-1"  # placeholder UUID
 db = SecureMessagingDB()
 _SERVER_PRIV_DER, SERVER_PUB_B64 = generate_server_keys()
+_PWD_HASHER = get_password_hasher()
 
 
 async def handle_client(ws):
@@ -24,6 +26,37 @@ async def handle_client(ws):
                 continue
 
             msg_type = frame.get("type")
+
+            # --- Auth: Register new user ---
+            if msg_type == UserAuthType.REGISTER:
+                sender = frame.get("from")
+                payload = frame.get("payload", {})
+                try:
+                    db.register_user(
+                        user_id=sender,
+                        pubkey=payload["pubkey"],
+                        privkey_store=payload["privkey_store"],
+                        pake_password=payload["pake_password"],
+                        meta={}
+                    )
+                    ack_payload = {"msg_ref": "REGISTER_OK"}
+                    await ws.send(make_envelope(
+                        msg_type="ACK",
+                        from_id=SERVER_ID,
+                        to_id=sender,
+                        payload=ack_payload,
+                        sig=sign_transport_payload(ack_payload, _SERVER_PRIV_DER)
+                    ))
+                except Exception as e:
+                    err_payload = {"code": "REGISTER_FAIL", "detail": str(e)}
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
+                        to_id=sender,
+                        payload=err_payload,
+                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER)
+                    ))
+                continue
 
             if msg_type == "USER_HELLO":
                 user_id = frame["from"]
@@ -37,14 +70,8 @@ async def handle_client(ws):
                 else:
                     tables.local_users[user_id] = ws
                     tables.user_locations[user_id] = "local"
-                    # Optionally store pubkeys if provided
+                    # Optionally use payload, but do not re-register here
                     payload = frame.get("payload", {})
-                    if payload.get("pubkey"):
-                        # Persist user registration minimally if not present
-                        try:
-                            db.register_user(user_id, payload.get("pubkey"), "SC1_placeholder", "pake_placeholder", meta={})
-                        except Exception:
-                            pass
                     db.update_presence(user_id, "online")
                     # Add to public channel and announce
                     db.add_member_to_public(user_id)
@@ -75,6 +102,47 @@ async def handle_client(ws):
                             to_id=target_server,
                             payload={"user_id": user_id, "server_id": SERVER_ID, "meta": {}}
                         ))
+
+            elif msg_type == UserAuthType.LOGIN_REQUEST:
+                uid = frame.get("from")
+                password = (frame.get("payload", {}) or {}).get("password", "")
+                auth = db.get_user_auth(uid)
+                if not auth:
+                    fail_payload = {"code": "NO_USER", "detail": "Unknown user"}
+                    await ws.send(make_envelope(
+                        msg_type=UserAuthType.LOGIN_FAIL,
+                        from_id=SERVER_ID,
+                        to_id=uid,
+                        payload=fail_payload,
+                        sig=sign_transport_payload(fail_payload, _SERVER_PRIV_DER)
+                    ))
+                    continue
+                try:
+                    if _PWD_HASHER.verify(auth["pake_password"], password):
+                        ok_payload = {
+                            "pubkey": auth["pubkey"],
+                            "privkey_store": auth["privkey_store"],
+                            "version": auth["version"],
+                        }
+                        await ws.send(make_envelope(
+                            msg_type=UserAuthType.LOGIN_SUCCESS,
+                            from_id=SERVER_ID,
+                            to_id=uid,
+                            payload=ok_payload,
+                            sig=sign_transport_payload(ok_payload, _SERVER_PRIV_DER)
+                        ))
+                    else:
+                        raise Exception("Invalid password")
+                except Exception:
+                    fail_payload = {"code": "BAD_PASSWORD", "detail": "Invalid credentials"}
+                    await ws.send(make_envelope(
+                        msg_type=UserAuthType.LOGIN_FAIL,
+                        from_id=SERVER_ID,
+                        to_id=uid,
+                        payload=fail_payload,
+                        sig=sign_transport_payload(fail_payload, _SERVER_PRIV_DER)
+                    ))
+                continue
 
             elif msg_type == "MSG_DIRECT":
                 sender = frame["from"]
