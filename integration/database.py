@@ -410,7 +410,7 @@ class SecureMessagingDB:
     
     def join_group(self, group_id: str, member_id: str, wrapped_key: str, role: str = "member") -> bool:
         added_at = int(datetime.now(timezone.utc).timestamp())
-        
+
         try:
             with sqlite3.connect(self.db_path) as conn:
                 # Check if user is already a member of this group
@@ -422,7 +422,7 @@ class SecureMessagingDB:
                 if existing:
                     logger.warning(f"User {member_id} is already a member of group {group_id}")
                     return False
-                    
+
                 conn.execute("""
                     INSERT OR REPLACE INTO group_members 
                     (group_id, member_id, role, wrapped_key, added_at)
@@ -430,6 +430,7 @@ class SecureMessagingDB:
                 """, (group_id, member_id, role, wrapped_key, added_at))
                 
                 conn.commit()
+                self.update_user_version(member_id)
                 logger.info(f"User {member_id} joined group {group_id}")
                 return True
                 
