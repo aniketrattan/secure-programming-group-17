@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -13,6 +13,11 @@ def generate_rsa4096_keypair() -> Tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey]:
     priv = rsa.generate_private_key(public_exponent=65537, key_size=RSA_BITS)
     return priv, priv.public_key()
 
+
+def assert_rsa4096(pub: rsa.RSAPublicKey) -> None:
+    n_bits = getattr(pub, "key_size", None)
+    if n_bits != RSA_BITS:
+        raise ValueError("RSA-4096 required")
 
 def public_key_to_b64url(pub: rsa.RSAPublicKey) -> str:
     der = pub.public_bytes(
@@ -51,7 +56,7 @@ def load_private_key_der(der_priv: bytes) -> rsa.RSAPrivateKey:
     return priv
 
 
-def encrypt_rsa_oaep(plaintext: bytes, pub: rsa.RSAPublicKey) -> bytes:
+def encrypt_rsa_oaep(plaintext: bytes, pub: rsa.RSAPublicKey, label: Optional[bytes] = None) -> bytes:
     if not isinstance(plaintext, (bytes, bytearray)):
         raise TypeError("plaintext must be bytes")
     if pub.key_size != RSA_BITS:
@@ -61,12 +66,12 @@ def encrypt_rsa_oaep(plaintext: bytes, pub: rsa.RSAPublicKey) -> bytes:
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
             algorithm=hashes.SHA256(),
-            label=None,
+            label=label,
         ),
     )
 
 
-def decrypt_rsa_oaep(ciphertext: bytes, priv: rsa.RSAPrivateKey) -> bytes:
+def decrypt_rsa_oaep(ciphertext: bytes, priv: rsa.RSAPrivateKey, label: Optional[bytes] = None) -> bytes:
     if not isinstance(ciphertext, (bytes, bytearray)):
         raise TypeError("ciphertext must be bytes")
     if priv.public_key().key_size != RSA_BITS:
@@ -78,7 +83,7 @@ def decrypt_rsa_oaep(ciphertext: bytes, priv: rsa.RSAPrivateKey) -> bytes:
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
             algorithm=hashes.SHA256(),
-            label=None,
+            label=label,
         ),
     )
 

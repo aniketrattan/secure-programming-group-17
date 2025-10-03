@@ -2,6 +2,7 @@ import asyncio
 import websockets
 import json
 import time
+import os
 
 from . import tables
 from .protocol import make_envelope, parse_envelope
@@ -9,12 +10,103 @@ from .customised_types import ServerMessageType, CustomisedMessageType, UserAuth
 from .database import SecureMessagingDB
 from .transport import generate_server_keys, sign_transport_payload
 from .crypto_services.secure_store import get_password_hasher
+from .crypto_services import (
+    b64url_encode,
+    b64url_decode,
+    encrypt_rsa_oaep,
+    sign_pss_sha256,
+    verify_pss_sha256,
+    load_public_key_b64url,
+    preimage_public,
+    preimage_file_chunk,
+    load_private_key_der,
+)
 
 
 SERVER_ID = "server-1"  # placeholder UUID
 db = SecureMessagingDB()
 _SERVER_PRIV_DER, SERVER_PUB_B64 = generate_server_keys()
+SERVER_PRIV = load_private_key_der(_SERVER_PRIV_DER)
 _PWD_HASHER = get_password_hasher()
+
+# Public channel versioning and wrapped key distribution (RSA-only; key not used for payloads)
+PUBLIC_GROUP_VERSION = 1
+PUBLIC_GROUP_KEY = os.urandom(32)
+
+
+async def broadcast_raw(raw: str) -> None:
+    # Send to all local users
+    for recipient_ws in list(tables.local_users.values()):
+        try:
+            await recipient_ws.send(raw)
+        except Exception:
+            pass
+    # Forward to peer servers
+    for to_server_id, server_ws in list(tables.servers.items()):
+        try:
+            await server_ws.send(raw)
+        except Exception:
+            pass
+
+
+async def send_public_key_share(ws, member_id: str):
+    pub_b64 = db.get_pubkey(member_id)
+    if not pub_b64:
+        return
+    member_pub = load_public_key_b64url(pub_b64)
+    wrapped = b64url_encode(encrypt_rsa_oaep(PUBLIC_GROUP_KEY, member_pub))
+    shares = [{"member": member_id, "wrapped_public_channel_key": wrapped}]
+
+    ts_ms = int(time.time() * 1000)
+    pm = preimage_public(ciphertext_b64url=wrapped, from_id="server", ts_ms=ts_ms)
+    content_sig = b64url_encode(sign_pss_sha256(pm, SERVER_PRIV))
+
+    # Send key-share directly to the member
+    await ws.send(make_envelope(
+        msg_type=ServerMessageType.PUBLIC_CHANNEL_KEY_SHARE,
+        from_id=SERVER_ID,
+        to_id=member_id,
+        payload={"version": PUBLIC_GROUP_VERSION, "shares": shares, "content_sig": content_sig},
+        sig=sign_transport_payload({"shares": shares}, _SERVER_PRIV_DER),
+        ts=ts_ms,
+    ))
+
+    # Broadcast updated version notice
+    await broadcast_raw(make_envelope(
+        msg_type=ServerMessageType.PUBLIC_CHANNEL_UPDATED,
+        from_id=SERVER_ID,
+        to_id="*",
+        payload={"version": PUBLIC_GROUP_VERSION, "added": [member_id]},
+        sig=sign_transport_payload({"version": PUBLIC_GROUP_VERSION}, _SERVER_PRIV_DER),
+        ts=ts_ms,
+    ))
+
+
+async def rotate_public_group(added: list[str] | None = None, removed: list[str] | None = None):
+    global PUBLIC_GROUP_VERSION, PUBLIC_GROUP_KEY
+    PUBLIC_GROUP_VERSION += 1
+    PUBLIC_GROUP_KEY = os.urandom(32)
+    ts_ms = int(time.time() * 1000)
+    # Send fresh key-shares to all local users
+    for uid, uws in list(tables.local_users.items()):
+        try:
+            await send_public_key_share(uws, uid)
+        except Exception:
+            pass
+    # Broadcast version bump
+    payload = {"version": PUBLIC_GROUP_VERSION}
+    if added:
+        payload["added"] = added
+    if removed:
+        payload["removed"] = removed
+    await broadcast_raw(make_envelope(
+        msg_type=ServerMessageType.PUBLIC_CHANNEL_UPDATED,
+        from_id=SERVER_ID,
+        to_id="*",
+        payload=payload,
+        sig=sign_transport_payload({"version": PUBLIC_GROUP_VERSION}, _SERVER_PRIV_DER),
+        ts=ts_ms,
+    ))
 
 
 async def handle_client(ws):
@@ -102,6 +194,11 @@ async def handle_client(ws):
                             to_id=target_server,
                             payload={"user_id": user_id, "server_id": SERVER_ID, "meta": {}}
                         ))
+
+                    # Send wrapped public channel key share to the user
+                    await send_public_key_share(ws, user_id)
+                    # Bump version on member join and redistribute
+                    await rotate_public_group(added=[user_id])
 
             elif msg_type == UserAuthType.LOGIN_REQUEST:
                 uid = frame.get("from")
@@ -193,30 +290,92 @@ async def handle_client(ws):
 
             elif msg_type == ServerMessageType.MSG_PUBLIC_CHANNEL:
                 sender = frame["from"]
-                group_id = frame["to"]
                 payload = frame.get("payload", {})
+                ts = frame.get("ts", 0)
 
-                members = set(db.get_public_members())
-                for member_id in list(tables.local_users.keys()):
-                    if member_id == sender or member_id not in members:
-                        continue
-                    out_payload = payload
-                    await tables.local_users[member_id].send(make_envelope(
-                        msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
-                        from_id=sender,
-                        to_id=group_id,
-                        payload=out_payload,
-                        sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER)
+                # Validate required fields
+                sender_pub_b64 = payload.get("sender_pub", "")
+                multict = payload.get("multict")
+
+                if not (ts and isinstance(multict, list) and multict and sender_pub_b64):
+                    err_payload = {"code": "INVALID_SIG", "detail": "missing fields"}
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
+                        to_id=sender,
+                        payload=err_payload,
+                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                        ts=int(time.time() * 1000),
                     ))
+                    continue
 
-                if sender in tables.local_users:
-                    for to_server_id, server_ws in tables.servers.items():
-                        if to_server_id != SERVER_ID:
-                            await server_ws.send(raw)
+                # Verify each item's content signature
+                try:
+                    sender_pub = load_public_key_b64url(sender_pub_b64)
+                except Exception:
+                    err_payload = {"code": "INVALID_SIG", "detail": "bad sender_pub"}
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
+                        to_id=sender,
+                        payload=err_payload,
+                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                        ts=int(time.time() * 1000),
+                    ))
+                    continue
+
+                # Fan-out per recipient
+                members = set(db.get_public_members())
+                for item in multict:
+                    rid = item.get("to")
+                    c = item.get("ciphertext")
+                    sig_item = item.get("content_sig", "")
+                    if not rid or rid not in members or not c or not sig_item:
+                        continue
+                    # Verify per-item signature binding
+                    if not verify_pss_sha256(preimage_public(c, sender, ts), b64url_decode(sig_item), sender_pub):
+                        continue
+                    if rid in tables.local_users:
+                        out_payload = {"ciphertext": c, "sender_pub": sender_pub_b64, "content_sig": sig_item}
+                        await tables.local_users[rid].send(make_envelope(
+                            msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
+                            from_id=sender,
+                            to_id=rid,
+                            payload=out_payload,
+                            sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER),
+                            ts=ts,
+                        ))
+
+                # Forward to peer servers unchanged (they will deliver to their local members)
+                for to_server_id, server_ws in tables.servers.items():
+                    if to_server_id != SERVER_ID:
+                        await server_ws.send(raw)
 
             elif msg_type in ["FILE_START", "FILE_CHUNK", "FILE_END"]:
                 sender = frame["from"]
                 recipient = frame["to"]
+
+                if msg_type == "FILE_CHUNK":
+                    p = frame.get("payload", {})
+                    ts = frame.get("ts", 0)
+                    try:
+                        pm = preimage_file_chunk(
+                            p.get("ciphertext", ""), sender, recipient, ts, p.get("file_id", ""), int(p.get("index", 0))
+                        )
+                        ok = verify_pss_sha256(pm, b64url_decode(p.get("content_sig", "")), load_public_key_b64url(p.get("sender_pub", "")))
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        err_payload = {"code": "INVALID_SIG", "detail": "bad file chunk sig"}
+                        await ws.send(make_envelope(
+                            msg_type="ERROR",
+                            from_id=SERVER_ID,
+                            to_id=sender,
+                            payload=err_payload,
+                            sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                            ts=int(time.time() * 1000),
+                        ))
+                        continue
 
                 if recipient in tables.local_users:
                     out_payload = frame.get("payload", {})
@@ -225,7 +384,8 @@ async def handle_client(ws):
                         from_id=sender,
                         to_id=recipient,
                         payload=out_payload,
-                        sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER)
+                        sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER),
+                        ts=frame.get("ts"),
                     ))
                 elif recipient in tables.user_locations and tables.user_locations.get(recipient) != "local":
                     # Forward (no wrap)
@@ -269,6 +429,18 @@ async def handle_client(ws):
                     payload=resp_payload,
                     sig=sign_transport_payload(resp_payload, _SERVER_PRIV_DER)
                 ))
+            elif msg_type == ServerMessageType.PUBLIC_MEMBERS_SNAPSHOT:
+                sender = frame.get("from")
+                members = db.get_public_members()
+                snapshot = {"members": members, "version": PUBLIC_GROUP_VERSION}
+                await ws.send(make_envelope(
+                    msg_type=ServerMessageType.PUBLIC_MEMBERS_SNAPSHOT,
+                    from_id=SERVER_ID,
+                    to_id=sender,
+                    payload=snapshot,
+                    sig=sign_transport_payload(snapshot, _SERVER_PRIV_DER),
+                    ts=int(time.time() * 1000),
+                ))
             else:
                 # ignore unknown
                 pass
@@ -302,6 +474,8 @@ async def handle_client(ws):
                     payload=upd_payload,
                     sig=sign_transport_payload(upd_payload, _SERVER_PRIV_DER)
                 ))
+            # Rotate public group on member removal
+            await rotate_public_group(removed=[user_id])
 
 
 async def start_server(host="localhost", port=8765):
