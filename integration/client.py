@@ -69,7 +69,8 @@ class Client:
             cmd = await loop.run_in_executor(None, input)
 
             if cmd.startswith(REGISTER_COMMAND):
-                uid = input("Choose user_id: ")
+                uid = str(uuid.uuid4())
+                print(f"Register for new user id {uid}")
                 password = input("Create password: ")
                 # Generate keys and protect private key
                 priv, pub = generate_rsa4096_keypair()
