@@ -20,6 +20,8 @@ from .crypto_services import (
     preimage_public,
     preimage_file_chunk,
     load_private_key_der,
+    preimage_keyshare,
+    assert_valid_ts,
 )
 
 
@@ -55,18 +57,31 @@ async def send_public_key_share(ws, member_id: str):
         return
     member_pub = load_public_key_b64url(pub_b64)
     wrapped = b64url_encode(encrypt_rsa_oaep(PUBLIC_GROUP_KEY, member_pub))
-    shares = [{"member": member_id, "wrapped_public_channel_key": wrapped}]
+    shares = [{"member": member_id, "wrapped_key": wrapped}]
 
     ts_ms = int(time.time() * 1000)
-    pm = preimage_public(ciphertext_b64url=wrapped, from_id="server", ts_ms=ts_ms)
+    # Sign shares with key-share preimage per SOCP: sha256(canon(shares)) || creator_pub
+    pm = preimage_keyshare(shares, SERVER_PUB_B64)
     content_sig = b64url_encode(sign_pss_sha256(pm, SERVER_PRIV))
+
+    # Persist wrapped key for membership semantics
+    try:
+        db.set_wrapped_public_key(member_id, wrapped, ts_ms)
+    except Exception:
+        pass
 
     # Send key-share directly to the member
     await ws.send(make_envelope(
         msg_type=ServerMessageType.PUBLIC_CHANNEL_KEY_SHARE,
         from_id=SERVER_ID,
         to_id=member_id,
-        payload={"version": PUBLIC_GROUP_VERSION, "shares": shares, "content_sig": content_sig},
+        payload={
+            "group_id": "public",
+            "version": PUBLIC_GROUP_VERSION,
+            "shares": shares,
+            "creator_pub": SERVER_PUB_B64,
+            "content_sig": content_sig,
+        },
         sig=sign_transport_payload({"shares": shares}, _SERVER_PRIV_DER),
         ts=ts_ms,
     ))
@@ -124,6 +139,19 @@ async def handle_client(ws):
                 sender = frame.get("from")
                 payload = frame.get("payload", {})
                 try:
+                    # Enforce RSA-4096 on ingest; return BAD_KEY if invalid
+                    try:
+                        load_public_key_b64url(payload["pubkey"])
+                    except Exception as exc:
+                        err_payload = {"code": "BAD_KEY", "detail": "RSA-4096 required"}
+                        await ws.send(make_envelope(
+                            msg_type="ERROR",
+                            from_id=SERVER_ID,
+                            to_id=sender,
+                            payload=err_payload,
+                            sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER)
+                        ))
+                        continue
                     db.register_user(
                         user_id=sender,
                         pubkey=payload["pubkey"],
@@ -140,7 +168,8 @@ async def handle_client(ws):
                         sig=sign_transport_payload(ack_payload, _SERVER_PRIV_DER)
                     ))
                 except Exception as e:
-                    err_payload = {"code": "REGISTER_FAIL", "detail": str(e)}
+                    code = "BAD_KEY" if "RSA-4096" in str(e) else "REGISTER_FAIL"
+                    err_payload = {"code": code, "detail": str(e)}
                     await ws.send(make_envelope(
                         msg_type="ERROR",
                         from_id=SERVER_ID,
@@ -157,7 +186,8 @@ async def handle_client(ws):
                         msg_type="ERROR",
                         from_id=SERVER_ID,
                         to_id=user_id,
-                        payload={"code": "NAME_IN_USE", "detail": "User id already existed"}
+                        payload={"code": "NAME_IN_USE", "detail": "User id already existed"},
+                        sig=sign_transport_payload({"code": "NAME_IN_USE", "detail": "User id already existed"}, _SERVER_PRIV_DER),
                     ))
                 else:
                     tables.local_users[user_id] = ws
@@ -195,9 +225,7 @@ async def handle_client(ws):
                             payload={"user_id": user_id, "server_id": SERVER_ID, "meta": {}}
                         ))
 
-                    # Send wrapped public channel key share to the user
-                    await send_public_key_share(ws, user_id)
-                    # Bump version on member join and redistribute
+                    # Bump version on member join and redistribute (sends key-shares to all including this user)
                     await rotate_public_group(added=[user_id])
 
             elif msg_type == UserAuthType.LOGIN_REQUEST:
@@ -281,11 +309,13 @@ async def handle_client(ws):
                         sig=sign_transport_payload(srv_payload, _SERVER_PRIV_DER)
                     ))
                 else:
+                    err_payload = {"code": "USER_NOT_FOUND", "detail": f"{recipient} not online"}
                     await ws.send(make_envelope(
                         msg_type="ERROR",
                         from_id=SERVER_ID,
                         to_id=sender,
-                        payload={"code": "USER_NOT_FOUND", "detail": f"{recipient} not online"}
+                        payload=err_payload,
+                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER)
                     ))
 
             elif msg_type == ServerMessageType.MSG_PUBLIC_CHANNEL:
@@ -296,24 +326,18 @@ async def handle_client(ws):
                 # Validate required fields
                 sender_pub_b64 = payload.get("sender_pub", "")
                 multict = payload.get("multict")
+                single_ct = payload.get("ciphertext")
 
-                if not (ts and isinstance(multict, list) and multict and sender_pub_b64):
-                    err_payload = {"code": "INVALID_SIG", "detail": "missing fields"}
-                    await ws.send(make_envelope(
-                        msg_type="ERROR",
-                        from_id=SERVER_ID,
-                        to_id=sender,
-                        payload=err_payload,
-                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
-                        ts=int(time.time() * 1000),
-                    ))
-                    continue
-
-                # Verify each item's content signature
                 try:
                     sender_pub = load_public_key_b64url(sender_pub_b64)
                 except Exception:
-                    err_payload = {"code": "INVALID_SIG", "detail": "bad sender_pub"}
+                    sender_pub = None
+
+                # Enforce non-zero timestamp
+                try:
+                    assert_valid_ts(ts)
+                except Exception:
+                    err_payload = {"code": "INVALID_SIG", "detail": "bad ts"}
                     await ws.send(make_envelope(
                         msg_type="ERROR",
                         from_id=SERVER_ID,
@@ -324,32 +348,107 @@ async def handle_client(ws):
                     ))
                     continue
 
-                # Fan-out per recipient
-                members = set(db.get_public_members())
-                for item in multict:
-                    rid = item.get("to")
-                    c = item.get("ciphertext")
-                    sig_item = item.get("content_sig", "")
-                    if not rid or rid not in members or not c or not sig_item:
-                        continue
-                    # Verify per-item signature binding
-                    if not verify_pss_sha256(preimage_public(c, sender, ts), b64url_decode(sig_item), sender_pub):
-                        continue
-                    if rid in tables.local_users:
-                        out_payload = {"ciphertext": c, "sender_pub": sender_pub_b64, "content_sig": sig_item}
-                        await tables.local_users[rid].send(make_envelope(
-                            msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
-                            from_id=sender,
-                            to_id=rid,
-                            payload=out_payload,
-                            sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER),
-                            ts=ts,
+                if multict:
+                    if not (ts and isinstance(multict, list) and sender_pub):
+                        err_payload = {"code": "INVALID_SIG", "detail": "missing fields"}
+                        await ws.send(make_envelope(
+                            msg_type="ERROR",
+                            from_id=SERVER_ID,
+                            to_id=sender,
+                            payload=err_payload,
+                            sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                            ts=int(time.time() * 1000),
                         ))
-
-                # Forward to peer servers unchanged (they will deliver to their local members)
-                for to_server_id, server_ws in tables.servers.items():
-                    if to_server_id != SERVER_ID:
-                        await server_ws.send(raw)
+                        continue
+                    members = set(db.get_public_members())
+                    for item in multict:
+                        rid = item.get("to")
+                        c = item.get("ciphertext")
+                        sig_item = item.get("content_sig", "")
+                        if not rid or rid not in members or not c or not sig_item:
+                            continue
+                        if not verify_pss_sha256(preimage_public(c, sender, ts), b64url_decode(sig_item), sender_pub):
+                            continue
+                        if rid in tables.local_users:
+                            out_payload = {"ciphertext": c, "sender_pub": sender_pub_b64, "content_sig": sig_item}
+                            await tables.local_users[rid].send(make_envelope(
+                                msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
+                                from_id=sender,
+                                to_id=rid,
+                                payload=out_payload,
+                                sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER),
+                                ts=ts,
+                            ))
+                    for to_server_id, server_ws in tables.servers.items():
+                        if to_server_id != SERVER_ID:
+                            await server_ws.send(raw)
+                elif single_ct:
+                    sig_b64 = payload.get("content_sig", "")
+                    if not (ts and sender_pub and sig_b64):
+                        err_payload = {"code": "INVALID_SIG", "detail": "missing fields"}
+                        await ws.send(make_envelope(
+                            msg_type="ERROR",
+                            from_id=SERVER_ID,
+                            to_id=sender,
+                            payload=err_payload,
+                            sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                            ts=int(time.time() * 1000),
+                        ))
+                        continue
+                    if not verify_pss_sha256(preimage_public(single_ct, sender, ts), b64url_decode(sig_b64), sender_pub):
+                        err_payload = {"code": "INVALID_SIG", "detail": "bad content_sig"}
+                        await ws.send(make_envelope(
+                            msg_type="ERROR",
+                            from_id=SERVER_ID,
+                            to_id=sender,
+                            payload=err_payload,
+                            sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                            ts=int(time.time() * 1000),
+                        ))
+                        continue
+                    # Deliver only to addressed recipient
+                    members = set(db.get_public_members())
+                    dest = frame.get("to")
+                    out_payload = {
+                        "ciphertext": single_ct,
+                        "sender_pub": sender_pub_b64,
+                        "content_sig": sig_b64,
+                        "public_version": payload.get("public_version"),
+                    }
+                    if dest and dest in members:
+                        if dest in tables.local_users:
+                            await tables.local_users[dest].send(make_envelope(
+                                msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
+                                from_id=sender,
+                                to_id=dest,
+                                payload=out_payload,
+                                sig=sign_transport_payload(out_payload, _SERVER_PRIV_DER),
+                                ts=ts,
+                            ))
+                        elif dest in tables.user_locations and tables.user_locations.get(dest) != "local":
+                            # Forward to the owning server only
+                            to_server_id = tables.user_locations[dest]
+                            await tables.servers[to_server_id].send(raw)
+                        else:
+                            err_payload = {"code": "USER_NOT_FOUND", "detail": f"{dest} not online"}
+                            await ws.send(make_envelope(
+                                msg_type="ERROR",
+                                from_id=SERVER_ID,
+                                to_id=sender,
+                                payload=err_payload,
+                                sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                                ts=int(time.time() * 1000),
+                            ))
+                else:
+                    err_payload = {"code": "FORMAT", "detail": "missing multict or ciphertext"}
+                    await ws.send(make_envelope(
+                        msg_type="ERROR",
+                        from_id=SERVER_ID,
+                        to_id=sender,
+                        payload=err_payload,
+                        sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                        ts=int(time.time() * 1000),
+                    ))
 
             elif msg_type in ["FILE_START", "FILE_CHUNK", "FILE_END"]:
                 sender = frame["from"]
@@ -358,9 +457,23 @@ async def handle_client(ws):
                 if msg_type == "FILE_CHUNK":
                     p = frame.get("payload", {})
                     ts = frame.get("ts", 0)
+                    # Enforce non-zero timestamp
+                    try:
+                        assert_valid_ts(ts)
+                    except Exception:
+                        err_payload = {"code": "INVALID_SIG", "detail": "bad ts"}
+                        await ws.send(make_envelope(
+                            msg_type="ERROR",
+                            from_id=SERVER_ID,
+                            to_id=sender,
+                            payload=err_payload,
+                            sig=sign_transport_payload(err_payload, _SERVER_PRIV_DER),
+                            ts=int(time.time() * 1000),
+                        ))
+                        continue
                     try:
                         pm = preimage_file_chunk(
-                            p.get("ciphertext", ""), sender, recipient, ts, p.get("file_id", ""), int(p.get("index", 0))
+                            p.get("ciphertext", ""), sender, recipient, ts, p.get("file_id", ""), int(p.get("index", 0)), int(p.get("total", 0))
                         )
                         ok = verify_pss_sha256(pm, b64url_decode(p.get("content_sig", "")), load_public_key_b64url(p.get("sender_pub", "")))
                     except Exception:

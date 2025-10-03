@@ -5,6 +5,7 @@ from .canonical import (
     preimage_keyshare,
     preimage_public,
     preimage_file_chunk,
+    assert_valid_ts,
 )
 from .rsa import (
     decrypt_rsa_oaep,

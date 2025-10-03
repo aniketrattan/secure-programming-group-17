@@ -87,9 +87,9 @@ class SecureMessagingDB:
                 CREATE TABLE IF NOT EXISTS groups (
                     group_id TEXT PRIMARY KEY,
                     creator_id TEXT NOT NULL,
-                    created_at INTEGER,
+                    created_at INTEGER NOT NULL,
                     meta TEXT,
-                    version INTEGER DEFAULT 1
+                    version INTEGER NOT NULL DEFAULT 1
                 )
             """)
             
@@ -100,7 +100,7 @@ class SecureMessagingDB:
                     member_id TEXT NOT NULL,
                     role TEXT DEFAULT 'member',
                     wrapped_key TEXT NOT NULL,
-                    added_at INTEGER,
+                    added_at INTEGER NOT NULL,
                     PRIMARY KEY (group_id, member_id),
                     FOREIGN KEY (group_id) REFERENCES groups (group_id) ON DELETE CASCADE
                 )
@@ -189,6 +189,19 @@ class SecureMessagingDB:
             conn.execute(
                 "INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES ('public', ?)",
                 (user_id,)
+            )
+            conn.commit()
+
+    def set_wrapped_public_key(self, member_id: str, wrapped_b64: str, added_at: int) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            # Ensure group and member rows exist
+            conn.execute(
+                "INSERT OR IGNORE INTO groups (group_id, creator_id, created_at, meta, version) VALUES ('public','system', ?, '{\"title\":\"Public Channel\"}', 1)",
+                (int(datetime.now(timezone.utc).timestamp()),)
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO group_members (group_id, member_id, role, wrapped_key, added_at) VALUES ('public', ?, COALESCE((SELECT role FROM group_members WHERE group_id='public' AND member_id=?),'member'), ?, ?)",
+                (member_id, member_id, wrapped_b64, added_at)
             )
             conn.commit()
 
