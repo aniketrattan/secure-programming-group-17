@@ -42,6 +42,13 @@ def _collect_peers(cli_peers: list[str] | None) -> list[str]:
 
 
 async def _run(host: str, port: int, server_id: str, peers: list[str]) -> None:
+    # Validate server_id is UUID v4
+    try:
+        import uuid as _uuid
+        if str(_uuid.UUID(server_id, version=4)) != server_id:
+            raise ValueError
+    except Exception:
+        raise SystemExit("--server-id must be a UUID v4")
     task = asyncio.create_task(core_main_loop(host, port, server_id, peers))
 
     stop = asyncio.Event()
