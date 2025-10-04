@@ -8,12 +8,19 @@ from typing import Dict, Any, Optional
 import websockets
 from websockets.server import WebSocketServerProtocol
 from .transport import generate_server_keys, sign_transport_payload, verify_transport_payload
-from .crypto_services.canonical import canonical_payload_bytes
+from .database import SecureMessagingDB
+from .crypto_services.secure_store import get_password_hasher
+from .crypto_services.rsa import load_public_key_b64url, verify_pss_sha256
+from .crypto_services.base64url import b64url_decode
+from .crypto_services.canonical import canonical_payload_bytes, preimage_public, preimage_file_chunk, assert_valid_ts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 HEARTBEAT_INTERVAL = 15
 HEARTBEAT_TIMEOUT = 45
+SEEN_CACHE_SIZE = 2000
+RECONNECT_BASE = 2
+RECONNECT_MAX = 60
 
 # Envelope keys: type, from, to, ts, payload, sig
 
@@ -59,19 +66,29 @@ class ServerCore:
         # Map server_id -> server public key (base64url)
         self.server_pubkeys: Dict[str, str] = {}
 
+        # Map server_id -> learned server address info
+        self.server_addrs: Dict[str, Dict[str, Any]] = {}
+
         # Map user_id -> (server_id, last_seen_ts)
         self.user_locations: Dict[str, Dict[str, Any]] = {}
 
         # Local clients: user_id -> ws
         self.local_clients: Dict[str, WebSocketServerProtocol] = {}
 
-        # Loop suppression (ts|from|to|hash(payload))
+        # Loop suppression (type|from|to|ts|hash(payload))
         from collections import deque
         self._seen_keys = set()
-        self._seen_order = deque(maxlen=2048)
+        self._seen_order = deque(maxlen=SEEN_CACHE_SIZE)
 
         # Lock
         self.lock = asyncio.Lock()
+
+        # Reconnect tasks keyed by server_id
+        self._reconnect_tasks: Dict[str, asyncio.Task] = {}
+
+        # DB and password hasher for login/register integration
+        self.db = SecureMessagingDB()
+        self._pwd_hasher = get_password_hasher()
 
     def sign_envelope(self, envelope: Dict[str, Any]) -> str:
         payload = envelope.get('payload', {})
@@ -89,29 +106,31 @@ class ServerCore:
         return verify_transport_payload(payload, sig, pub_b64)
 
     def _make_seen_key(self, envelope: Dict[str, Any]) -> str:
+        typ = envelope.get('type')
         ts = envelope.get('ts')
         frm = envelope.get('from')
         to = envelope.get('to')
         payload = envelope.get('payload', {})
         h = hashlib.sha256(canonical_payload_bytes(payload)).hexdigest()
-        return f"{ts}|{frm}|{to}|{h}"
+        return f"{typ}|{frm}|{to}|{ts}|{h}"
 
     def _dedup_and_mark(self, envelope: Dict[str, Any]) -> bool:
         key = self._make_seen_key(envelope)
         if key in self._seen_keys:
             return True
-        self._seen_keys.add(key)
-        self._seen_order.append(key)
+        # Evict oldest if at capacity before appending new key
         if len(self._seen_order) == self._seen_order.maxlen:
             old = self._seen_order.popleft()
             if old in self._seen_keys:
                 self._seen_keys.discard(old)
+        self._seen_order.append(key)
+        self._seen_keys.add(key)
         return False
 
-    async def handler(self, ws: WebSocketServerProtocol, path: str):
+    async def handler(self, ws: WebSocketServerProtocol, path: Optional[str] = None):
         # Wait for an initial HELLO from the connecting peer (client or server)
         try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            raw = await asyncio.wait_for(ws.recv(), timeout=120)
         except Exception as e:
             logging.info('No HELLO received, closing connection: %s', e)
             await ws.close()
@@ -124,9 +143,10 @@ class ServerCore:
             await ws.close()
             return
 
-        # Basic validation
-        if msg.get('type') not in ('USER_HELLO', 'SERVER_HELLO_JOIN'):
-            logging.warning('Unexpected initial message: %s', msg.get('type'))
+        # Accept initial client REGISTER/LOGIN per SOCP-friendly flow
+        first_type = msg.get('type')
+        if first_type not in ('USER_HELLO', 'SERVER_HELLO_JOIN', 'LOCAL_REGISTER', 'LOGIN_REQUEST'):
+            logging.warning('Unexpected initial message: %s', first_type)
             await ws.close()
             return
 
@@ -139,15 +159,19 @@ class ServerCore:
             if is_server and remote_id:
                 self.server_peers[remote_id] = conn
 
-        # Complete handshake
+        # Complete handshake or process initial client auth
         if is_server:
             await self.handle_server_join(conn, msg)
-        else:
+        elif first_type == 'USER_HELLO':
             await self.handle_client_join(conn, msg)
+        else:
+            # Process initial REGISTER/LOGIN frame before loops start
+            await self.handle_envelope(conn, msg)
 
-        # Launch recv and heartbeat tasks
+        # Launch recv and heartbeat tasks (heartbeats only for server peers)
         conn._recv_task = asyncio.create_task(self.receive_loop(conn))
-        conn._heartbeat_task = asyncio.create_task(self.heartbeat_loop(conn))
+        if conn.is_server:
+            conn._heartbeat_task = asyncio.create_task(self.heartbeat_loop(conn))
 
         # Wait for connection tasks to finish
         try:
@@ -159,29 +183,37 @@ class ServerCore:
 
     async def handle_server_join(self, conn: PeerConnection, hello_msg: Dict[str, Any]):
         logging.info('Server joining: %s', conn.remote_id)
-        # Capture remote pubkey if provided
+        # Capture remote pubkey/address if provided
         try:
             remote_id = hello_msg.get('from')
-            remote_pub = hello_msg.get('payload', {}).get('pubkey')
+            payload = hello_msg.get('payload', {}) or {}
+            remote_pub = payload.get('pubkey')
+            ws_uri = payload.get('ws_uri')
             if remote_id and remote_pub:
                 self.server_pubkeys[remote_id] = remote_pub
+            if remote_id and ws_uri:
+                self.server_addrs[remote_id] = {'ws_uri': ws_uri}
         except Exception:
             pass
 
-        # Respond with SERVER_WELCOME (include our pubkey)
-        welcome = self._make_envelope('SERVER_WELCOME', self.server_id, conn.remote_id,
-                                      payload={'server_id': self.server_id, 'server_pub': self.server_pub_b64})
+        # Respond with SERVER_WELCOME including snapshot
+        async with self.lock:
+            snapshot = {'user_locations': dict(self.user_locations)}
+        welcome = self._make_envelope(
+            'SERVER_WELCOME',
+            self.server_id,
+            conn.remote_id,
+            payload={'server_id': self.server_id, 'server_pub': self.server_pub_b64, 'snapshot': snapshot}
+        )
         await self._send_raw(conn, welcome)
 
-        # Send SERVER_ANNOUNCE to all servers announcing presence (host, port, pubkey)
+        # Send SERVER_ANNOUNCE to all servers announcing presence (host, port, pubkey, ws_uri)
         announce = self._make_envelope('SERVER_ANNOUNCE', self.server_id, '*',
-                                       payload={'server_id': self.server_id, 'host': self.host, 'port': self.port, 'pubkey': self.server_pub_b64})
+                                       payload={'server_id': self.server_id, 'host': self.host, 'port': self.port, 'pubkey': self.server_pub_b64, 'ws_uri': f"ws://{self.host}:{self.port}"})
         await self.broadcast_to_servers(announce, exclude=[conn.remote_id])
 
-        # Share current user_locations snapshot
-        async with self.lock:
-            snapshot = {'user_locations': self.user_locations}
-        snap_msg = self._make_envelope('SERVER_ANNOUNCE', self.server_id, conn.remote_id, payload=snapshot)
+        # Share current user_locations snapshot directly to the new server as an ANNOUNCE
+        snap_msg = self._make_envelope('SERVER_ANNOUNCE', self.server_id, conn.remote_id, payload={'user_locations': snapshot['user_locations']})
         await self._send_raw(conn, snap_msg)
 
     async def handle_client_join(self, conn: PeerConnection, hello_msg: Dict[str, Any]):
@@ -191,8 +223,21 @@ class ServerCore:
             logging.info('Client connected without user_id')
         else:
             async with self.lock:
+                if user_id in self.local_clients:
+                    err = {'code': 'NAME_IN_USE', 'detail': 'User id already existed'}
+                    out = self._make_envelope('ERROR', self.server_id, user_id, payload=err)
+                    try:
+                        await conn.ws.send(json.dumps(out))
+                    except Exception:
+                        pass
+                    return
                 self.local_clients[user_id] = conn.ws
                 self.user_locations[user_id] = {'server_id': self.server_id, 'ts': time.time()}
+            # Add to public channel membership for /all support
+            try:
+                self.db.add_member_to_public(user_id)
+            except Exception:
+                pass
             # Gossip to peers
             adv = self._make_envelope('USER_ADVERTISE', self.server_id, '*', payload={'user_id': user_id, 'server_id': self.server_id})
             await self.broadcast_to_servers(adv)
@@ -201,6 +246,13 @@ class ServerCore:
         # send CLIENT_WELCOME
         welcome = self._make_envelope('CLIENT_WELCOME', self.server_id, user_id or 'unknown', payload={'server_id': self.server_id})
         await self._send_raw(conn, welcome)
+        # send ACK with server_pub for client-side transport verify
+        ack_payload = {'msg_ref': 'USER_HELLO_OK', 'server_pub': self.server_pub_b64}
+        ack = self._make_envelope('ACK', self.server_id, user_id or 'unknown', payload=ack_payload)
+        try:
+            await conn.ws.send(json.dumps(ack))
+        except Exception:
+            pass
 
     def _make_envelope(self, typ: str, from_id: str, to_id: str, payload: Any = None) -> Dict[str, Any]:
         envelope = {
@@ -247,6 +299,11 @@ class ServerCore:
                 if now - conn.last_recv > HEARTBEAT_TIMEOUT:
                     logging.warning('Connection timed out: %s', conn.remote_id or 'client')
                     await conn.close()
+                    # schedule reconnect if we know where to connect
+                    if conn.remote_id:
+                        addr = self.server_addrs.get(conn.remote_id, {}).get('ws_uri')
+                        if addr and conn.remote_id not in self._reconnect_tasks:
+                            self._reconnect_tasks[conn.remote_id] = asyncio.create_task(self._reconnect_loop(addr, conn.remote_id))
                     break
                 await asyncio.sleep(HEARTBEAT_INTERVAL / 3)
         except asyncio.CancelledError:
@@ -263,9 +320,36 @@ class ServerCore:
                     continue
 
                 conn.touch()
+                # Transport verify gate for server→server frames (skip only initial SERVER_HELLO_JOIN per SOCP)
+                if conn.is_server:
+                    typ = envelope.get('type')
+                    # Skip verify for early welcome/announce until pubkey learned (SOCP §6.1)
+                    if typ not in ('SERVER_HELLO_JOIN', 'SERVER_WELCOME', 'SERVER_ANNOUNCE', 'HEARTBEAT'):
+                        # For frames where envelope['from'] may be a user (e.g., MSG_PUBLIC_CHANNEL),
+                        # fall back to verifying with the connection's server pubkey
+                        sig = envelope.get('sig')
+                        payload = envelope.get('payload', {})
+                        pub_id = envelope.get('from')
+                        pub_b64 = self.server_pubkeys.get(pub_id)
+                        if not pub_b64 and conn.remote_id:
+                            pub_b64 = self.server_pubkeys.get(conn.remote_id)
+                        ok = bool(sig and pub_b64 and verify_transport_payload(payload, sig, pub_b64))
+                        if not ok:
+                            logging.warning('Dropping server frame with invalid transport sig from %s', conn.remote_id or 'unknown')
+                            continue
+
+                # Duplicate suppression (payload-aware)
+                if self._dedup_and_mark(envelope):
+                    continue
+
                 await self.handle_envelope(conn, envelope)
         except websockets.exceptions.ConnectionClosed:
             logging.info('Connection closed: %s', conn.remote_id or 'client')
+            # schedule reconnect if possible
+            if conn.is_server and conn.remote_id:
+                addr = self.server_addrs.get(conn.remote_id, {}).get('ws_uri')
+                if addr and conn.remote_id not in self._reconnect_tasks:
+                    self._reconnect_tasks[conn.remote_id] = asyncio.create_task(self._reconnect_loop(addr, conn.remote_id))
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -274,15 +358,7 @@ class ServerCore:
     async def handle_envelope(self, conn: PeerConnection, envelope: Dict[str, Any]):
         typ = envelope.get('type')
 
-        # Loop suppression
-        if self._dedup_and_mark(envelope):
-            return
-
-        # Signature verification for server frames except early handshake/announce
-        if conn.is_server and typ not in ('HEARTBEAT', 'SERVER_HELLO_JOIN', 'SERVER_WELCOME', 'SERVER_ANNOUNCE'):
-            if not self.verify_signature(envelope):
-                logging.warning('Invalid signature from server %s', conn.remote_id)
-                return
+        # At this point, dedupe and verify were already handled in receive_loop
 
         if typ == 'HEARTBEAT':
             return
@@ -290,26 +366,207 @@ class ServerCore:
             await self._handle_user_advertise(envelope)
         elif typ == 'USER_REMOVE':
             await self._handle_user_remove(envelope)
-        elif typ == 'USER_MESSAGE':
+        elif typ == 'USER_HELLO':
+            # Allow USER_HELLO after login to attach presence/state
+            await self.handle_client_join(conn, envelope)
+        elif typ == 'USER_MESSAGE' or typ == 'MSG_DIRECT':
             await self._handle_user_message(envelope)
+        elif typ == 'MSG_PUBLIC_CHANNEL':
+            await self._handle_public_channel(envelope)
         elif typ == 'SERVER_DELIVER':
             await self._handle_server_deliver(envelope)
+        elif typ in ('FILE_START', 'FILE_CHUNK', 'FILE_END'):
+            await self._handle_file(envelope)
         elif typ == 'SERVER_ANNOUNCE':
             await self._handle_server_announce(conn, envelope)
         elif typ == 'SERVER_WELCOME':
-            # Learn pubkey and remote id
-            payload = envelope.get('payload', {})
+            # Learn pubkey, remote id and merge snapshot
+            payload = envelope.get('payload', {}) or {}
             remote_pub = payload.get('server_pub')
             frm = envelope.get('from')
             if frm and remote_pub:
                 self.server_pubkeys[frm] = remote_pub
+            snapshot = payload.get('snapshot') or {}
+            user_snap = snapshot.get('user_locations', {}) if isinstance(snapshot, dict) else {}
+            if isinstance(user_snap, dict):
+                async with self.lock:
+                    for uid, info in user_snap.items():
+                        existing = self.user_locations.get(uid)
+                        if not existing or info.get('ts', 0) > existing.get('ts', 0):
+                            self.user_locations[uid] = info
             logging.info('Received welcome from %s', frm)
         elif typ == 'CLIENT_WELCOME':
             logging.info('Received welcome: %s', typ)
         elif typ == 'CLIENT_REGISTER':
             await self._handle_client_register(conn, envelope)
+        elif typ in ('LOCAL_REGISTER', 'REGISTER'):
+            await self._handle_register(conn, envelope)
+        elif typ == 'LOGIN_REQUEST':
+            await self._handle_login(conn, envelope)
+        elif typ == 'LIST_REQUEST':
+            # Respond with known online user_ids (sorted)
+            async with self.lock:
+                online = sorted(self.user_locations.keys())
+            payload = {'online_users': online}
+            out = self._make_envelope('LIST_RESPONSE', self.server_id, envelope.get('from') or '*', payload=payload)
+            try:
+                await conn.ws.send(json.dumps(out))
+            except Exception:
+                pass
+        elif typ == 'PUBKEY_REQUEST' or typ == 'PUBLIC_MEMBERS_SNAPSHOT':
+            # Return recipient's pubkey from DB if available
+            pld = (envelope.get('payload', {}) or {})
+            if typ == 'PUBLIC_MEMBERS_SNAPSHOT':
+                # Return current public members and version; version is not persisted here
+                members = self.db.get_public_members()
+                resp_payload = {'members': members, 'version': 1}
+                out = self._make_envelope('PUBLIC_MEMBERS_SNAPSHOT', self.server_id, envelope.get('from') or '*', payload=resp_payload)
+            else:
+                target = pld.get('user_id')
+                pub = self.db.get_pubkey(target) if target else None
+                resp_payload = {'user_id': target, 'pubkey': pub}
+                out = self._make_envelope('PUBKEY_RESPONSE', self.server_id, envelope.get('from') or '*', payload=resp_payload)
+            try:
+                await conn.ws.send(json.dumps(out))
+            except Exception:
+                pass
+        elif typ == 'CTRL_CLOSE':
+            # Graceful client-initiated close
+            try:
+                await conn.ws.close(code=1000)
+            except Exception:
+                pass
         else:
-            logging.info('Unhandled envelope type: %s', typ)
+            # Reply with standard UNKNOWN_TYPE error (transport-signed)
+            err = {'code': 'UNKNOWN_TYPE', 'detail': f'Unhandled type {typ}'}
+            out = self._make_envelope('ERROR', self.server_id, envelope.get('from') or '*', payload=err)
+            try:
+                await conn.ws.send(json.dumps(out))
+            except Exception:
+                pass
+
+    async def _handle_file(self, envelope: Dict[str, Any]):
+        typ = envelope.get('type')
+        sender = envelope.get('from')
+        recipient = envelope.get('to')
+        if not recipient:
+            return
+        async with self.lock:
+            loc = self.user_locations.get(recipient)
+        if loc is None:
+            logging.info('FILE_* target %s unknown; dropping', recipient)
+            return
+        if loc['server_id'] == self.server_id:
+            # Deliver to local user, transport-sign with this server key
+            async with self.lock:
+                ws = self.local_clients.get(recipient)
+            if ws:
+                out = {
+                    'type': typ,
+                    'from': sender,
+                    'to': recipient,
+                    'ts': envelope.get('ts') or int(time.time() * 1000),
+                    'payload': envelope.get('payload', {}) or {}
+                }
+                out['sig'] = self.sign_envelope(out)
+                try:
+                    await ws.send(json.dumps(out))
+                except Exception:
+                    pass
+            else:
+                logging.info('Local user %s not connected; removing', recipient)
+                remove = self._make_envelope('USER_REMOVE', self.server_id, '*', payload={'user_id': recipient})
+                await self._handle_user_remove(remove)
+        else:
+            # Forward to authoritative server, transport-sign with this server
+            dest_server = loc['server_id']
+            fwd = {
+                'type': typ,
+                'from': sender,
+                'to': recipient,
+                'ts': envelope.get('ts') or int(time.time() * 1000),
+                'payload': envelope.get('payload', {}) or {}
+            }
+            fwd['sig'] = self.sign_envelope(fwd)
+            await self.send_to_server(dest_server, fwd)
+            logging.info('Forwarded %s to server %s for user %s', typ, dest_server, recipient)
+
+    async def _handle_public_channel(self, envelope: Dict[str, Any]):
+        payload = envelope.get('payload', {}) or {}
+        to_user = envelope.get('to')
+        sender_user = envelope.get('from')
+        if not to_user:
+            return
+        # Verify content signature as per SOCP (server does not decrypt, but can sanity-check)
+        ts = envelope.get('ts') or 0
+        ct_b64 = payload.get('ciphertext', '')
+        sender_pub_b64 = payload.get('sender_pub', '')
+        sig_b64 = payload.get('content_sig', '')
+        ok = False
+        try:
+            sender_pub = load_public_key_b64url(sender_pub_b64)
+            pm = preimage_public(ct_b64, sender_user, ts)
+            ok = verify_pss_sha256(pm, b64url_decode(sig_b64), sender_pub)
+        except Exception:
+            ok = False
+        if not ok:
+            err = {'code': 'INVALID_SIG', 'detail': 'bad content_sig'}
+            out = self._make_envelope('ERROR', self.server_id, sender_user or '*', payload=err)
+            try:
+                await conn.ws.send(json.dumps(out))
+            except Exception:
+                pass
+            return
+        async with self.lock:
+            loc = self.user_locations.get(to_user)
+        if loc is None:
+            logging.info('Public target %s unknown; dropping', to_user)
+            return
+        if loc['server_id'] == self.server_id:
+            # Deliver to local user as MSG_PUBLIC_CHANNEL; from must be the original sender user id
+            async with self.lock:
+                ws = self.local_clients.get(to_user)
+            if ws:
+                out = {
+                    'type': 'MSG_PUBLIC_CHANNEL',
+                    'from': sender_user,
+                    'to': to_user,
+                    'ts': envelope.get('ts') or int(time.time() * 1000),
+                    'payload': {
+                        'ciphertext': payload.get('ciphertext', ''),
+                        'sender_pub': payload.get('sender_pub', ''),
+                        'content_sig': payload.get('content_sig', ''),
+                        'public_version': payload.get('public_version'),
+                    }
+                }
+                out['sig'] = self.sign_envelope(out)
+                try:
+                    await ws.send(json.dumps(out))
+                except Exception:
+                    pass
+            else:
+                logging.info('Local user %s not connected for public; removing', to_user)
+                remove = self._make_envelope('USER_REMOVE', self.server_id, '*', payload={'user_id': to_user})
+                await self._handle_user_remove(remove)
+        else:
+            # Forward to authoritative server. Keep 'from' as original user for client verification,
+            # but transport-sign with our server key; receiving side verifies against connection server key
+            dest_server = loc['server_id']
+            fwd = {
+                'type': 'MSG_PUBLIC_CHANNEL',
+                'from': sender_user,
+                'to': to_user,
+                'ts': envelope.get('ts') or int(time.time() * 1000),
+                'payload': {
+                    'ciphertext': payload.get('ciphertext', ''),
+                    'sender_pub': payload.get('sender_pub', ''),
+                    'content_sig': payload.get('content_sig', ''),
+                    'public_version': payload.get('public_version'),
+                }
+            }
+            fwd['sig'] = self.sign_envelope(fwd)
+            await self.send_to_server(dest_server, fwd)
+            logging.info('Forwarded public to server %s for user %s', dest_server, to_user)
 
     async def _handle_user_advertise(self, envelope: Dict[str, Any]):
         payload = envelope.get('payload', {})
@@ -337,6 +594,10 @@ class ServerCore:
                     pass
                 del self.local_clients[user_id]
         logging.info('User removed: %s', user_id)
+        try:
+            self.db.remove_member_from_public(user_id)
+        except Exception:
+            pass
         await self.broadcast_to_servers(envelope)
 
     async def _handle_user_message(self, envelope: Dict[str, Any]):
@@ -349,6 +610,13 @@ class ServerCore:
         async with self.lock:
             loc = self.user_locations.get(to_user)
         if loc is None:
+            # Return standard USER_NOT_FOUND to sender (transport-signed)
+            err = {'code': 'USER_NOT_FOUND', 'detail': f'{to_user} not online'}
+            out = self._make_envelope('ERROR', self.server_id, envelope.get('from') or '*', payload=err)
+            try:
+                await conn.ws.send(json.dumps(out))
+            except Exception:
+                pass
             logging.info('User %s unknown, cannot route', to_user)
             return
         if loc['server_id'] == self.server_id:
@@ -356,7 +624,22 @@ class ServerCore:
                 ws = self.local_clients.get(to_user)
             if ws:
                 try:
-                    await ws.send(json.dumps(envelope))
+                    # Wrap to USER_DELIVER (transport-signed) per SOCP §7.2
+                    deliver_payload = {
+                        'ciphertext': payload.get('ciphertext', ''),
+                        'sender': envelope.get('from'),
+                        'sender_pub': payload.get('sender_pub', ''),
+                        'content_sig': payload.get('content_sig', ''),
+                    }
+                    out = {
+                        'type': 'USER_DELIVER',
+                        'from': self.server_id,
+                        'to': to_user,
+                        'ts': envelope.get('ts') or int(time.time() * 1000),
+                        'payload': deliver_payload,
+                    }
+                    out['sig'] = self.sign_envelope(out)
+                    await ws.send(json.dumps(out))
                     logging.info('Delivered message to local user %s', to_user)
                 except Exception as e:
                     logging.warning('Failed to deliver to local user %s: %s', to_user, e)
@@ -366,7 +649,17 @@ class ServerCore:
                 await self._handle_user_remove(remove)
         else:
             dest_server = loc['server_id']
-            await self.send_to_server(dest_server, envelope)
+            # Forward via SERVER_DELIVER per SOCP §6.3
+            srv_payload = {
+                'user_id': to_user,
+                'ciphertext': payload.get('ciphertext', ''),
+                'sender': envelope.get('from'),
+                'sender_pub': payload.get('sender_pub', ''),
+                'content_sig': payload.get('content_sig', ''),
+                'orig_ts': envelope.get('ts'),
+            }
+            fwd = self._make_envelope('SERVER_DELIVER', self.server_id, dest_server, payload=srv_payload)
+            await self.send_to_server(dest_server, fwd)
             logging.info('Forwarded message to server %s for user %s', dest_server, to_user)
 
     async def _handle_server_deliver(self, envelope: Dict[str, Any]):
@@ -388,7 +681,7 @@ class ServerCore:
                     'ciphertext': payload.get('ciphertext', ''),
                     'sender': payload.get('sender'),
                     'sender_pub': payload.get('sender_pub', ''),
-                    'content_sig': payload.get('content_sig', '')
+                    'content_sig': payload.get('content_sig', ''),
                 }
                 out = {
                     'type': 'USER_DELIVER',
@@ -422,6 +715,9 @@ class ServerCore:
         # Learn pubkey if present
         if server_id and payload.get('pubkey'):
             self.server_pubkeys[server_id] = payload['pubkey']
+        # Remember ws_uri if present
+        if server_id and payload.get('ws_uri'):
+            self.server_addrs[server_id] = {'ws_uri': payload['ws_uri']}
 
         if 'user_locations' in payload:
             snap = payload['user_locations']
@@ -446,6 +742,60 @@ class ServerCore:
         adv = self._make_envelope('USER_ADVERTISE', self.server_id, '*', payload={'user_id': user_id, 'server_id': self.server_id})
         await self.broadcast_to_servers(adv)
 
+    async def _handle_register(self, conn: PeerConnection, envelope: Dict[str, Any]):
+        payload = envelope.get('payload', {}) or {}
+        user_id = envelope.get('from')
+        pubkey = payload.get('pubkey', '')
+        privkey_store = payload.get('privkey_store', '')
+        pake_password = payload.get('pake_password', '')
+        if not (user_id and pubkey and privkey_store and pake_password):
+            err = {'code': 'REGISTER_FAIL', 'detail': 'missing fields'}
+            out = self._make_envelope('ERROR', self.server_id, user_id or '*', payload=err)
+            await conn.ws.send(json.dumps(out))
+            return
+        try:
+            # Enforce RSA-4096 key validity
+            load_public_key_b64url(pubkey)
+            self.db.register_user(user_id, pubkey, privkey_store, pake_password, meta={})
+            ack = {'msg_ref': 'REGISTER_OK'}
+            out = self._make_envelope('ACK', self.server_id, user_id, payload=ack)
+            await conn.ws.send(json.dumps(out))
+        except Exception as e:
+            code = 'BAD_KEY' if 'RSA' in str(e) else 'REGISTER_FAIL'
+            err = {'code': code, 'detail': str(e)}
+            out = self._make_envelope('ERROR', self.server_id, user_id, payload=err)
+            await conn.ws.send(json.dumps(out))
+
+    async def _handle_login(self, conn: PeerConnection, envelope: Dict[str, Any]):
+        user_id = envelope.get('from')
+        password = (envelope.get('payload', {}) or {}).get('password', '')
+        if not (user_id and password):
+            fail = {'code': 'NO_USER', 'detail': 'missing credentials'}
+            out = self._make_envelope('LOGIN_FAIL', self.server_id, user_id or '*', payload=fail)
+            await conn.ws.send(json.dumps(out))
+            return
+        auth = self.db.get_user_auth(user_id)
+        if not auth:
+            fail = {'code': 'NO_USER', 'detail': 'Unknown user'}
+            out = self._make_envelope('LOGIN_FAIL', self.server_id, user_id, payload=fail)
+            await conn.ws.send(json.dumps(out))
+            return
+        try:
+            if self._pwd_hasher.verify(auth['pake_password'], password):
+                ok = {
+                    'pubkey': auth['pubkey'],
+                    'privkey_store': auth['privkey_store'],
+                    'version': auth['version'],
+                }
+                out = self._make_envelope('LOGIN_SUCCESS', self.server_id, user_id, payload=ok)
+                await conn.ws.send(json.dumps(out))
+            else:
+                raise Exception('Invalid password')
+        except Exception:
+            fail = {'code': 'BAD_PASSWORD', 'detail': 'Invalid credentials'}
+            out = self._make_envelope('LOGIN_FAIL', self.server_id, user_id, payload=fail)
+            await conn.ws.send(json.dumps(out))
+
     async def cleanup_connection(self, conn: PeerConnection):
         async with self.lock:
             if conn.ws in self.connections:
@@ -466,7 +816,7 @@ class ServerCore:
         try:
             ws = await websockets.connect(uri)
             hello = {'type': 'SERVER_HELLO_JOIN', 'from': self.server_id, 'to': '*', 'ts': int(time.time() * 1000),
-                     'payload': {'host': self.host, 'port': self.port, 'pubkey': self.server_pub_b64}}
+                     'payload': {'host': self.host, 'port': self.port, 'pubkey': self.server_pub_b64, 'ws_uri': uri}}
             hello['sig'] = self.sign_envelope(hello)
             await ws.send(json.dumps(hello))
 
@@ -478,6 +828,8 @@ class ServerCore:
                 self.connections[ws] = conn
                 if remote_server_id:
                     self.server_peers[remote_server_id] = conn
+                if remote_server_id:
+                    self.server_addrs[remote_server_id] = {'ws_uri': uri}
             conn._recv_task = asyncio.create_task(self.receive_loop(conn))
             conn._heartbeat_task = asyncio.create_task(self.heartbeat_loop(conn))
             logging.info('Connected to peer %s', uri)
@@ -486,14 +838,47 @@ class ServerCore:
             logging.exception('Failed to connect to peer %s: %s', uri, e)
             return None
 
+    async def _reconnect_loop(self, uri: str, expected_server_id: Optional[str] = None):
+        delay = RECONNECT_BASE
+        key = expected_server_id or uri
+        logging.info('Starting reconnect loop to %s (expect id=%s)', uri, expected_server_id)
+        try:
+            while True:
+                if expected_server_id:
+                    async with self.lock:
+                        if expected_server_id in self.server_peers:
+                            logging.info('Already connected to %s; stopping reconnect', expected_server_id)
+                            break
+                conn = await self.connect_to_peer(uri, remote_server_id=expected_server_id)
+                if conn:
+                    logging.info('Reconnect succeeded to %s', conn.remote_id or uri)
+                    break
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX)
+        except asyncio.CancelledError:
+            logging.info('Reconnect loop canceled for %s', key)
+        finally:
+            if expected_server_id and expected_server_id in self._reconnect_tasks:
+                del self._reconnect_tasks[expected_server_id]
+            elif key in self._reconnect_tasks:
+                self._reconnect_tasks.pop(key, None)
+
+    def list_status(self) -> Dict[str, Any]:
+        return {
+            'known_users': list(self.user_locations.keys()),
+            'known_servers': list(self.server_peers.keys()),
+            'local_clients': list(self.local_clients.keys()),
+            'reconnect_tasks': list(self._reconnect_tasks.keys()),
+        }
+
 
 async def main_loop(host: str, port: int, server_id: str, peer_uris: list):
     core = ServerCore(server_id, host, port)
 
-    async def ws_handler(ws, path):
+    async def ws_handler(ws, path=None):
         await core.handler(ws, path)
 
-    server = await websockets.serve(ws_handler, host, port)
+    server = await websockets.serve(ws_handler, host, port, ping_interval=None, ping_timeout=None)
     logging.info('Server %s listening on %s:%s', server_id, host, port)
 
     for p in peer_uris:
@@ -502,9 +887,11 @@ async def main_loop(host: str, port: int, server_id: str, peer_uris: list):
     async def status_printer():
         while True:
             await asyncio.sleep(20)
-            async with core.lock:
-                logging.info('Known users: %s', list(core.user_locations.keys()))
-                logging.info('Known servers: %s', list(core.server_peers.keys()))
+            st = core.list_status()
+            logging.info('Known users: %s', st['known_users'])
+            logging.info('Known servers: %s', st['known_servers'])
+            logging.info('Local clients: %s', st['local_clients'])
+            logging.info('Reconnect tasks: %s', st['reconnect_tasks'])
 
     await status_printer()
 
