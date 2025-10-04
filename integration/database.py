@@ -10,7 +10,6 @@ import logging
 import uuid
 from .crypto_services.rsa import load_public_key_b64url
 
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -395,7 +394,7 @@ class SecureMessagingDB:
             logger.error(f"Failed to register user {user_id}: {e}")
             raise ValueError(f"User ID {user_id} already exists")
 
-     def _get_or_create_public_channel_key(self, conn) -> bytes:
+    def _get_or_create_public_channel_key(self, conn) -> bytes:
             """
             ADDED: Get or create the public channel's group key.
 
@@ -439,28 +438,28 @@ class SecureMessagingDB:
             """
             return secrets.token_bytes(32)  # 256 bits
 
-        def wrap_group_key(self, group_key: bytes, recipient_pubkey_b64: str) -> str:
-            """
-            ADDED: Wrap a group key using the recipient's RSA-4096 public key.
+    def wrap_group_key(self, group_key: bytes, recipient_pubkey_b64: str) -> str:
+        """
+        ADDED: Wrap a group key using the recipient's RSA-4096 public key.
 
-            Args:
-                group_key: 32-byte group key to wrap
-                recipient_pubkey_b64: base64url encoded RSA-4096 public key
+        Args:
+            group_key: 32-byte group key to wrap
+            recipient_pubkey_b64: base64url encoded RSA-4096 public key
 
-            Returns:
-                base64url encoded wrapped key (no padding)
-            """
-            if not self.crypto:
-                raise RuntimeError("Crypto module not initialized")
+        Returns:
+            base64url encoded wrapped key (no padding)
+        """
+        if not self.crypto:
+            raise RuntimeError("Crypto module not initialized")
 
-            # Load the public key from base64url
-            pub_key = self.crypto.load_public_key_b64url(recipient_pubkey_b64)
+        # Load the public key from base64url
+        pub_key = self.crypto.load_public_key_b64url(recipient_pubkey_b64)
 
-            # Encrypt the group key using RSA-OAEP
-            wrapped_bytes = self.crypto.encrypt_rsa_oaep(group_key, pub_key)
+        # Encrypt the group key using RSA-OAEP
+        wrapped_bytes = self.crypto.encrypt_rsa_oaep(group_key, pub_key)
 
-            # Encode to base64url
-            return self.crypto.b64url_encode(wrapped_bytes)
+        # Encode to base64url
+        return self.crypto.b64url_encode(wrapped_bytes)
 
 
     def get_user_auth(self, user_id: str) -> Optional[Dict[str, Any]]:
