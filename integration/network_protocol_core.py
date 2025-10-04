@@ -90,6 +90,9 @@ class ServerCore:
         self.db = SecureMessagingDB()
         self._pwd_hasher = get_password_hasher()
 
+        # Public channel version tracking (for PUBLIC_MEMBERS_SNAPSHOT/UPDATED)
+        self.public_group_version = 1
+
     def sign_envelope(self, envelope: Dict[str, Any]) -> str:
         payload = envelope.get('payload', {})
         return sign_transport_payload(payload, self._priv_der)
@@ -152,6 +155,16 @@ class ServerCore:
 
         is_server = msg['type'] == 'SERVER_HELLO_JOIN'
         remote_id = msg.get('from')
+        # Enforce UUID v4 for server_id on server joins
+        if is_server and isinstance(remote_id, str):
+            import uuid as _uuid
+            try:
+                if str(_uuid.UUID(remote_id, version=4)) != remote_id:
+                    raise ValueError
+            except Exception:
+                logging.warning('Rejecting non-UUIDv4 server_id: %s', remote_id)
+                await ws.close()
+                return
 
         conn = PeerConnection(ws, is_server=is_server, remote_id=remote_id)
         async with self.lock:
@@ -212,13 +225,28 @@ class ServerCore:
                                        payload={'server_id': self.server_id, 'host': self.host, 'port': self.port, 'pubkey': self.server_pub_b64, 'ws_uri': f"ws://{self.host}:{self.port}"})
         await self.broadcast_to_servers(announce, exclude=[conn.remote_id])
 
-        # Share current user_locations snapshot directly to the new server as an ANNOUNCE
-        snap_msg = self._make_envelope('SERVER_ANNOUNCE', self.server_id, conn.remote_id, payload={'user_locations': snapshot['user_locations']})
+        # Share current user_locations snapshot directly to the new server as an ANNOUNCE (include server_id)
+        snap_msg = self._make_envelope('SERVER_ANNOUNCE', self.server_id, conn.remote_id, payload={'server_id': self.server_id, 'user_locations': snapshot['user_locations']})
         await self._send_raw(conn, snap_msg)
 
     async def handle_client_join(self, conn: PeerConnection, hello_msg: Dict[str, Any]):
         # USER_HELLO
         user_id = hello_msg.get('payload', {}).get('user_id') or hello_msg.get('from')
+        # Enforce UUID v4 for user ids
+        if user_id:
+            import uuid as _uuid
+            try:
+                if str(_uuid.UUID(user_id, version=4)) != user_id:
+                    raise ValueError
+            except Exception:
+                logging.info('Rejecting USER_HELLO with non-UUIDv4 user_id: %s', user_id)
+                err = {'code': 'BAD_KEY', 'detail': 'UUID v4 required'}
+                out = self._make_envelope('ERROR', self.server_id, user_id or '*', payload=err)
+                try:
+                    await conn.ws.send(json.dumps(out))
+                except Exception:
+                    pass
+                return
         if not user_id:
             logging.info('Client connected without user_id')
         else:
@@ -242,6 +270,17 @@ class ServerCore:
             adv = self._make_envelope('USER_ADVERTISE', self.server_id, '*', payload={'user_id': user_id, 'server_id': self.server_id})
             await self.broadcast_to_servers(adv)
             logging.info('Client %s joined locally', user_id)
+
+            # Bump persisted public channel version and broadcast update
+            try:
+                nv = self.db.update_group_version('public')
+                self.public_group_version = nv or (self.public_group_version + 1)
+            except Exception:
+                self.public_group_version += 1
+            upd_payload = {'version': self.public_group_version, 'added': [user_id]}
+            upd = self._make_envelope('PUBLIC_CHANNEL_UPDATED', self.server_id, '*', payload=upd_payload)
+            logging.info('PUBLIC_CHANNEL_UPDATED v%s (added=%s)', self.public_group_version, [user_id])
+            await self.broadcast_to_servers(upd)
 
         # send CLIENT_WELCOME
         welcome = self._make_envelope('CLIENT_WELCOME', self.server_id, user_id or 'unknown', payload={'server_id': self.server_id})
@@ -323,7 +362,7 @@ class ServerCore:
                 # Transport verify gate for server→server frames (skip only initial SERVER_HELLO_JOIN per SOCP)
                 if conn.is_server:
                     typ = envelope.get('type')
-                    # Skip verify for early welcome/announce until pubkey learned (SOCP §6.1)
+                    # Skip verify for early hello/welcome/announce until pubkey learned (SOCP §6.1)
                     if typ not in ('SERVER_HELLO_JOIN', 'SERVER_WELCOME', 'SERVER_ANNOUNCE', 'HEARTBEAT'):
                         # For frames where envelope['from'] may be a user (e.g., MSG_PUBLIC_CHANNEL),
                         # fall back to verifying with the connection's server pubkey
@@ -333,6 +372,14 @@ class ServerCore:
                         pub_b64 = self.server_pubkeys.get(pub_id)
                         if not pub_b64 and conn.remote_id:
                             pub_b64 = self.server_pubkeys.get(conn.remote_id)
+                        # If still unknown but we have a prior pin for the expected server id, try that
+                        if not pub_b64 and conn.remote_id:
+                            try:
+                                pub_b64 = self.db.get_trusted_server_pubkey(conn.remote_id)
+                                if pub_b64:
+                                    self.server_pubkeys[conn.remote_id] = pub_b64
+                            except Exception:
+                                pass
                         ok = bool(sig and pub_b64 and verify_transport_payload(payload, sig, pub_b64))
                         if not ok:
                             logging.warning('Dropping server frame with invalid transport sig from %s', conn.remote_id or 'unknown')
@@ -386,6 +433,11 @@ class ServerCore:
             frm = envelope.get('from')
             if frm and remote_pub:
                 self.server_pubkeys[frm] = remote_pub
+            # Ensure we register this connection as a peer for broadcasts
+            if frm and (conn.remote_id is None or conn.remote_id != frm):
+                conn.remote_id = frm
+                async with self.lock:
+                    self.server_peers[frm] = conn
             snapshot = payload.get('snapshot') or {}
             user_snap = snapshot.get('user_locations', {}) if isinstance(snapshot, dict) else {}
             if isinstance(user_snap, dict):
@@ -417,9 +469,10 @@ class ServerCore:
             # Return recipient's pubkey from DB if available
             pld = (envelope.get('payload', {}) or {})
             if typ == 'PUBLIC_MEMBERS_SNAPSHOT':
-                # Return current public members and version; version is not persisted here
+                # Return current public members and the persisted version from DB
                 members = self.db.get_public_members()
-                resp_payload = {'members': members, 'version': 1}
+                version = self.db.get_public_version()
+                resp_payload = {'members': members, 'version': version}
                 out = self._make_envelope('PUBLIC_MEMBERS_SNAPSHOT', self.server_id, envelope.get('from') or '*', payload=resp_payload)
             else:
                 target = pld.get('user_id')
@@ -600,11 +653,43 @@ class ServerCore:
             pass
         await self.broadcast_to_servers(envelope)
 
+        # Bump persisted public channel version and broadcast update
+        try:
+            nv = self.db.update_group_version('public')
+            self.public_group_version = nv or (self.public_group_version + 1)
+        except Exception:
+            self.public_group_version += 1
+        upd_payload = {'version': self.public_group_version, 'removed': [user_id]}
+        upd = self._make_envelope('PUBLIC_CHANNEL_UPDATED', self.server_id, '*', payload=upd_payload)
+        logging.info('PUBLIC_CHANNEL_UPDATED v%s (removed=%s)', self.public_group_version, [user_id])
+        await self.broadcast_to_servers(upd)
+
     async def _handle_user_message(self, envelope: Dict[str, Any]):
         payload = envelope.get('payload', {})
         to_user = envelope.get('to') or payload.get('to_user')
         if not to_user:
             logging.debug('User_message without recipient')
+            return
+
+        # Server-side content_sig verification (drop malformed early)
+        sender = envelope.get('from')
+        ct_b64 = payload.get('ciphertext', '')
+        sender_pub_b64 = payload.get('sender_pub', '')
+        sig_b64 = payload.get('content_sig', '')
+        ts = envelope.get('ts') or 0
+        ok = False
+        try:
+            from .crypto_services.rsa import load_public_key_b64url
+            from .crypto_services.base64url import b64url_decode
+            from .crypto_services.canonical import preimage_dm
+            spub = load_public_key_b64url(sender_pub_b64)
+            pm = preimage_dm(ct_b64, sender, to_user, ts)
+            from .crypto_services.rsa import verify_pss_sha256
+            ok = verify_pss_sha256(pm, b64url_decode(sig_b64), spub)
+        except Exception:
+            ok = False
+        if not ok:
+            logging.info('Dropping MSG_DIRECT with invalid content_sig from %s', sender)
             return
 
         async with self.lock:
@@ -797,6 +882,7 @@ class ServerCore:
             await conn.ws.send(json.dumps(out))
 
     async def cleanup_connection(self, conn: PeerConnection):
+        # First update connection maps under lock and collect affected user_ids
         async with self.lock:
             if conn.ws in self.connections:
                 del self.connections[conn.ws]
@@ -804,13 +890,15 @@ class ServerCore:
                 del self.server_peers[conn.remote_id]
 
             to_remove = [uid for uid, ws in self.local_clients.items() if ws is conn.ws]
+            # Do not mutate user tables here; let _handle_user_remove manage state
             for uid in to_remove:
                 logging.info('Cleaning up local client %s', uid)
-                del self.local_clients[uid]
-                if uid in self.user_locations:
-                    del self.user_locations[uid]
-                remove = self._make_envelope('USER_REMOVE', self.server_id, '*', payload={'user_id': uid})
-                await self.broadcast_to_servers(remove)
+
+        # After releasing the lock, emit USER_REMOVE for each collected uid so that
+        # _handle_user_remove can safely acquire the lock and bump public version
+        for uid in to_remove:
+            remove = self._make_envelope('USER_REMOVE', self.server_id, '*', payload={'user_id': uid})
+            await self._handle_user_remove(remove)
 
     async def connect_to_peer(self, uri: str, remote_server_id: Optional[str] = None):
         try:
@@ -830,6 +918,11 @@ class ServerCore:
                     self.server_peers[remote_server_id] = conn
                 if remote_server_id:
                     self.server_addrs[remote_server_id] = {'ws_uri': uri}
+            # Process the first handshake message (e.g., SERVER_WELCOME/ANNOUNCE)
+            try:
+                await self.handle_envelope(conn, msg)
+            except Exception:
+                pass
             conn._recv_task = asyncio.create_task(self.receive_loop(conn))
             conn._heartbeat_task = asyncio.create_task(self.heartbeat_loop(conn))
             logging.info('Connected to peer %s', uri)
@@ -878,7 +971,8 @@ async def main_loop(host: str, port: int, server_id: str, peer_uris: list):
     async def ws_handler(ws, path=None):
         await core.handler(ws, path)
 
-    server = await websockets.serve(ws_handler, host, port, ping_interval=None, ping_timeout=None)
+    # WS health: enable ping/pong for client links via default settings, disable only for server peers (handled in app heartbeat)
+    server = await websockets.serve(ws_handler, host, port, ping_interval=HEARTBEAT_INTERVAL, ping_timeout=HEARTBEAT_TIMEOUT)
     logging.info('Server %s listening on %s:%s', server_id, host, port)
 
     for p in peer_uris:

@@ -42,6 +42,13 @@ def _collect_peers(cli_peers: list[str] | None) -> list[str]:
 
 
 async def _run(host: str, port: int, server_id: str, peers: list[str]) -> None:
+    # Validate server_id is UUID v4
+    try:
+        import uuid as _uuid
+        if str(_uuid.UUID(server_id, version=4)) != server_id:
+            raise ValueError
+    except Exception:
+        raise SystemExit("--server-id must be a UUID v4")
     task = asyncio.create_task(core_main_loop(host, port, server_id, peers))
 
     stop = asyncio.Event()
@@ -81,7 +88,7 @@ async def _run(host: str, port: int, server_id: str, peers: list[str]) -> None:
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-    parser = argparse.ArgumentParser(description="SOCP integration server runner")
+    parser = argparse.ArgumentParser(description="SOCP integration server runner (core)")
     parser.add_argument("--bind", default=os.getenv("BIND", "ws://127.0.0.1:8765"), help="Bind address ws://host:port")
     parser.add_argument("--peer", action="append", help="Peer ws://host:port (repeatable)")
     parser.add_argument("--server-id", default=os.getenv("SERVER_ID", "server-1"), help="Stable server UUID")
