@@ -106,7 +106,7 @@ class SecureMessagingDB:
                 )
             """)
             
-            # user sessions table (Chatgpt, "not in SOCP spec but useful for implementation")
+            # user sessions table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_sessions (
                     session_id TEXT PRIMARY KEY,
