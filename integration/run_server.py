@@ -81,7 +81,7 @@ async def _run(host: str, port: int, server_id: str, peers: list[str]) -> None:
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-    parser = argparse.ArgumentParser(description="SOCP integration server runner")
+    parser = argparse.ArgumentParser(description="SOCP integration server runner (core)")
     parser.add_argument("--bind", default=os.getenv("BIND", "ws://127.0.0.1:8765"), help="Bind address ws://host:port")
     parser.add_argument("--peer", action="append", help="Peer ws://host:port (repeatable)")
     parser.add_argument("--server-id", default=os.getenv("SERVER_ID", "server-1"), help="Stable server UUID")

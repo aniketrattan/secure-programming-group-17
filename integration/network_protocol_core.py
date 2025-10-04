@@ -90,6 +90,9 @@ class ServerCore:
         self.db = SecureMessagingDB()
         self._pwd_hasher = get_password_hasher()
 
+        # Public channel version tracking (for PUBLIC_MEMBERS_SNAPSHOT/UPDATED)
+        self.public_group_version = 1
+
     def sign_envelope(self, envelope: Dict[str, Any]) -> str:
         payload = envelope.get('payload', {})
         return sign_transport_payload(payload, self._priv_der)
@@ -242,6 +245,13 @@ class ServerCore:
             adv = self._make_envelope('USER_ADVERTISE', self.server_id, '*', payload={'user_id': user_id, 'server_id': self.server_id})
             await self.broadcast_to_servers(adv)
             logging.info('Client %s joined locally', user_id)
+
+            # Bump public channel version and broadcast update (no key-shares here)
+            self.public_group_version += 1
+            upd_payload = {'version': self.public_group_version, 'added': [user_id]}
+            upd = self._make_envelope('PUBLIC_CHANNEL_UPDATED', self.server_id, '*', payload=upd_payload)
+            logging.info('PUBLIC_CHANNEL_UPDATED v%s (added=%s)', self.public_group_version, [user_id])
+            await self.broadcast_to_servers(upd)
 
         # send CLIENT_WELCOME
         welcome = self._make_envelope('CLIENT_WELCOME', self.server_id, user_id or 'unknown', payload={'server_id': self.server_id})
@@ -600,6 +610,13 @@ class ServerCore:
             pass
         await self.broadcast_to_servers(envelope)
 
+        # Bump public channel version and broadcast update
+        self.public_group_version += 1
+        upd_payload = {'version': self.public_group_version, 'removed': [user_id]}
+        upd = self._make_envelope('PUBLIC_CHANNEL_UPDATED', self.server_id, '*', payload=upd_payload)
+        logging.info('PUBLIC_CHANNEL_UPDATED v%s (removed=%s)', self.public_group_version, [user_id])
+        await self.broadcast_to_servers(upd)
+
     async def _handle_user_message(self, envelope: Dict[str, Any]):
         payload = envelope.get('payload', {})
         to_user = envelope.get('to') or payload.get('to_user')
@@ -797,6 +814,7 @@ class ServerCore:
             await conn.ws.send(json.dumps(out))
 
     async def cleanup_connection(self, conn: PeerConnection):
+        # First update connection maps under lock and collect affected user_ids
         async with self.lock:
             if conn.ws in self.connections:
                 del self.connections[conn.ws]
@@ -804,13 +822,15 @@ class ServerCore:
                 del self.server_peers[conn.remote_id]
 
             to_remove = [uid for uid, ws in self.local_clients.items() if ws is conn.ws]
+            # Do not mutate user tables here; let _handle_user_remove manage state
             for uid in to_remove:
                 logging.info('Cleaning up local client %s', uid)
-                del self.local_clients[uid]
-                if uid in self.user_locations:
-                    del self.user_locations[uid]
-                remove = self._make_envelope('USER_REMOVE', self.server_id, '*', payload={'user_id': uid})
-                await self.broadcast_to_servers(remove)
+
+        # After releasing the lock, emit USER_REMOVE for each collected uid so that
+        # _handle_user_remove can safely acquire the lock and bump public version
+        for uid in to_remove:
+            remove = self._make_envelope('USER_REMOVE', self.server_id, '*', payload={'user_id': uid})
+            await self._handle_user_remove(remove)
 
     async def connect_to_peer(self, uri: str, remote_server_id: Optional[str] = None):
         try:
@@ -878,7 +898,8 @@ async def main_loop(host: str, port: int, server_id: str, peer_uris: list):
     async def ws_handler(ws, path=None):
         await core.handler(ws, path)
 
-    server = await websockets.serve(ws_handler, host, port, ping_interval=None, ping_timeout=None)
+    # WS health: enable ping/pong for client links via default settings, disable only for server peers (handled in app heartbeat)
+    server = await websockets.serve(ws_handler, host, port, ping_interval=HEARTBEAT_INTERVAL, ping_timeout=HEARTBEAT_TIMEOUT)
     logging.info('Server %s listening on %s:%s', server_id, host, port)
 
     for p in peer_uris:
