@@ -254,7 +254,7 @@ class SecureMessagingDB:
         meta_json = json.dumps(meta) if meta else None
         # Enforce RSA-4096 public key
         try:
-            load_public_key_b64url(pubkey)
+            public_key = load_public_key_b64url(pubkey)
         except Exception as exc:
             raise ValueError("Invalid RSA-4096 public key") from exc
 
@@ -278,6 +278,7 @@ class SecureMessagingDB:
                 )
 
                 wrapped_key = f"wrapped_key_for_{user_id}"  # Placeholder for RSA-OAEP wrapped channel key
+
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO group_members (group_id, member_id, role, wrapped_key, added_at)
