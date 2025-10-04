@@ -231,6 +231,27 @@ class ServerCore:
 
     async def handle_client_join(self, conn: PeerConnection, hello_msg: Dict[str, Any]):
         # USER_HELLO
+
+
+        # Check top-level keys
+        required_top = {"type", "from", "to", "ts", "payload", "sig"}
+        if not required_top.issubset(hello_msg.keys()):
+            logging.info(f"Rejecting USER_HELLO with missing required top-level keys {required_top - hello_msg.keys()}")
+            return 
+        
+        payload = hello_msg.get("payload")
+        if not isinstance(payload, dict):
+            logging.info("Rejecting USER_HELLO with non-object payload")
+            return 
+        
+        # Check payload 
+        required_payload = {"pubkey", "enc_pubkey"}
+        if not required_payload.issubset(payload.keys()):
+            logging.info(f"Rejecting USER_HELLO with missing payload keys {required_payload - payload.keys()}")
+            return
+
+
+
         user_id = hello_msg.get('payload', {}).get('user_id') or hello_msg.get('from')
         # Enforce UUID v4 for user ids
         if user_id:
@@ -261,6 +282,25 @@ class ServerCore:
                     return
                 self.local_clients[user_id] = conn.ws
                 self.user_locations[user_id] = {'server_id': self.server_id, 'ts': time.time()}
+            
+
+            # Validate pubkey
+            payload_pub = hello_msg.get('payload', {}).get('pubkey')
+            payload_enc_pub = hello_msg.get('payload', {}).get('enc_pubkey')
+
+
+            if payload_enc_pub != payload_pub:
+                logging.info(f"Rejecting USER_HELLO with non-identical pub and enc_pub from {user_id}")
+                return
+
+            
+            stored_pub = self.db.get_pubkey(user_id)
+            if payload_pub != stored_pub:
+                logging.info(f"Rejecting USER_HELLO with mismatching public key from {user_id}")
+                return
+
+
+            
             # Add to public channel membership for /all support
             try:
                 self.db.add_member_to_public(user_id)
