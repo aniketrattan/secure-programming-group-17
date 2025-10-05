@@ -1,3 +1,6 @@
+ #added Introducer/bootstrap trust root using pinned introducer list
+ #added ERROR: TIMEOUT frame emitted before closing idle server links
+
 import asyncio
 import json
 import argparse
@@ -7,18 +10,22 @@ import hmac
 import hashlib
 import base64
 import sys
-from typing import Dict, Any, Optional, Set, Deque
+from typing import Dict, Any, Optional, Set, Deque, Tuple, List
 from collections import deque
+
 import websockets
 from websockets.server import WebSocketServerProtocol
 from websockets.exceptions import ConnectionClosed
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# Tunables
 HEARTBEAT_INTERVAL = 15
 HEARTBEAT_TIMEOUT = 45
 SEEN_CACHE_SIZE = 2000
 RECONNECT_BASE = 2
 RECONNECT_MAX = 60
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -34,7 +41,6 @@ def b64u_decode(s: str) -> bytes:
 
 
 def canonical_payload_bytes(o: Any) -> bytes:
-    #canonical JSON for payload hashing
     return json.dumps(o or {}, separators=(",", ":"), sort_keys=True).encode()
 
 
@@ -66,40 +72,61 @@ class PeerConnection:
 
 
 class ServerCore:
-    def __init__(self, server_id: str, secret: str):
+    def __init__(self, server_id: str, secret: str, introducers: Dict[str, str]):
         self.server_id = server_id
         self.secret = secret.encode()
+        # introducers: id -> secret 
+        self.introducers: Dict[str, bytes] = {k: v.encode() for k, v in introducers.items()}
 
         # connections
         self.connections: Dict[WebSocketServerProtocol, PeerConnection] = {}
-        self.server_peers: Dict[str, PeerConnection] = {}  #server_id -> PeerConnection
-        self.server_addrs: Dict[str, Dict[str, Any]] = {}  #server_id -> {ws_uri,...}
-        #presence and routing
-        self.user_locations: Dict[str, Dict[str, Any]] = {}      #user_id -> {server_id, ts}
-        self.local_clients: Dict[str, WebSocketServerProtocol] = {} #user_id -> ws
+        self.server_peers: Dict[str, PeerConnection] = {}
+        self.server_addrs: Dict[str, Dict[str, Any]] = {}
 
-        #duplicate suppression
+        # presence and routing
+        self.user_locations: Dict[str, Dict[str, Any]] = {}
+        self.local_clients: Dict[str, WebSocketServerProtocol] = {}
+
+        # duplicate suppression
         self.seen: Set[str] = set()
         self.seen_q: Deque[str] = deque(maxlen=SEEN_CACHE_SIZE)
 
-        #reconnect tasks
+        # reconnect tasks
         self._reconnect_tasks: Dict[str, asyncio.Task] = {}
 
         self.lock = asyncio.Lock()
 
-        logging.info("server core %s initialized", self.server_id)
+        logging.info("server core %s initialized (introducers: %s)", self.server_id, list(self.introducers.keys()))
 
 
-    #signing and verification
-    def sign_envelope(self, env: Dict[str, Any]) -> str:
+    # Signing and verification
+
+    def sign_envelope(self, env: Dict[str, Any], key: Optional[bytes] = None) -> str:
+        # default sign with this server's secret
+        secret = key if key is not None else self.secret
         to_sign = (str(env.get("type", "")) + "|" +
                    str(env.get("from", "")) + "|" +
                    str(env.get("to", "")) + "|" +
                    str(env.get("ts", ""))).encode()
-        sig = hmac.new(self.secret, to_sign, hashlib.sha256).digest()
+        sig = hmac.new(secret, to_sign, hashlib.sha256).digest()
         return b64u_encode(sig)
 
+    def verify_signature_with_secret(self, env: Dict[str, Any], secret: bytes) -> bool:
+        sig = env.get("sig")
+        if not sig:
+            return False
+        to_sign = (str(env.get("type", "")) + "|" +
+                   str(env.get("from", "")) + "|" +
+                   str(env.get("to", "")) + "|" +
+                   str(env.get("ts", ""))).encode()
+        expected = hmac.new(secret, to_sign, hashlib.sha256).digest()
+        try:
+            return hmac.compare_digest(expected, b64u_decode(sig))
+        except Exception:
+            return False
+
     def verify_signature(self, env: Dict[str, Any]) -> bool:
+        # verify using our local secret (used for peers who share same secret in this demo)
         sig = env.get("sig")
         if not sig:
             return False
@@ -110,14 +137,14 @@ class ServerCore:
             return False
 
     def envelope_fingerprint(self, env: Dict[str, Any]) -> str:
-        #include payload hash to avoid naive collisions
         payload_hash = hashlib.sha256(canonical_payload_bytes(env.get("payload"))).hexdigest()
         key = f"{env.get('type','')}|{env.get('from','')}|{env.get('to','')}|{env.get('ts','')}|{payload_hash}"
         return hashlib.sha256(key.encode()).hexdigest()
 
-    #Handler (works with websockets >=12 where handler(ws) is used)
+
+    # Handler
+ 
     async def handler(self, ws: WebSocketServerProtocol, path: Optional[str] = None):
-        #HELLO message to for server or client.
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
         except Exception as e:
@@ -128,7 +155,7 @@ class ServerCore:
         try:
             msg = json.loads(raw)
         except Exception:
-            logging.warning("message not JSON; closing")
+            logging.warning("First message not JSON; closing")
             await ws.close()
             return
 
@@ -146,22 +173,23 @@ class ServerCore:
             if is_server and remote_id:
                 self.server_peers[remote_id] = conn
 
-        #if server hello, signature verification is needed before accepting
-        if is_server:
-            if not self.verify_signature(msg):
-                logging.warning("Invalid signature on initial SERVER_HELLO_JOIN from %s; closing", remote_id)
+        # If it's a server HELLO, verify signature if it's from a pinned introducer (optional)
+        if is_server and remote_id and remote_id in self.introducers:
+            # the incoming HELLO should be signed by that introducer's secret
+            if not self.verify_signature_with_secret(msg, self.introducers[remote_id]):
+                logging.warning("Invalid signature on SERVER_HELLO_JOIN from pinned introducer %s; closing", remote_id)
                 await ws.close()
                 async with self.lock:
                     self.connections.pop(ws, None)
                 return
 
-        #handle join flows
+        # process join flows
         if is_server:
             await self.handle_server_join(conn, msg)
         else:
             await self.handle_client_join(conn, msg)
 
-        #start loops
+        # start loops
         conn._recv_task = asyncio.create_task(self.receive_loop(conn))
         conn._heartbeat_task = asyncio.create_task(self.heartbeat_loop(conn))
         try:
@@ -171,18 +199,19 @@ class ServerCore:
         finally:
             await self.cleanup_connection(conn)
 
-    #bootstrap flows
+
+    # Bootstrapping flows
+
     async def handle_server_join(self, conn: PeerConnection, hello_msg: Dict[str, Any]):
         logging.info("Incoming SERVER_HELLO_JOIN from: %s", conn.remote_id)
         payload = hello_msg.get("payload", {}) or {}
-        # remember peer address
         remote_from = hello_msg.get("from")
         ws_uri = payload.get("ws_uri")
         if remote_from and ws_uri:
             async with self.lock:
                 self.server_addrs[remote_from] = {"ws_uri": ws_uri}
 
-        #send SERVER_WELCOME
+        # SERVER_WELCOME (include snapshot)
         async with self.lock:
             snapshot = {"user_locations": dict(self.user_locations)}
         welcome = {
@@ -195,7 +224,7 @@ class ServerCore:
         welcome["sig"] = self.sign_envelope(welcome)
         await self._send_raw(conn, welcome)
 
-        #broadcast SERVER_ANNOUNCE to other peers
+        #SERVER_ANNOUNCE to other peers (exclude joining one)
         announce_payload = {"server_id": self.server_id, "user_locations": dict(self.user_locations)}
         announce = {
             "type": "SERVER_ANNOUNCE",
@@ -214,7 +243,6 @@ class ServerCore:
             async with self.lock:
                 self.local_clients[user_id] = conn.ws
                 self.user_locations[user_id] = {"server_id": self.server_id, "ts": time.time()}
-            #gossip USER_ADVERTISE
             adv = {
                 "type": "USER_ADVERTISE",
                 "from": self.server_id,
@@ -225,16 +253,11 @@ class ServerCore:
             adv["sig"] = self.sign_envelope(adv)
             await self.broadcast_to_servers(adv)
             logging.info("Client %s joined locally", user_id)
-        #send CLIENT_WELCOME
-        welcome = {
-            "type": "CLIENT_WELCOME",
-            "from": self.server_id,
-            "to": user_id or "unknown",
-            "ts": now_ms(),
-            "payload": {"server_id": self.server_id}
-        }
+        welcome = {"type": "CLIENT_WELCOME", "from": self.server_id, "to": user_id or "unknown", "ts": now_ms(),
+                   "payload": {"server_id": self.server_id}}
         welcome["sig"] = self.sign_envelope(welcome)
         await self._send_raw(conn, welcome)
+
 
     #receive loop and heartbeat
     async def receive_loop(self, conn: PeerConnection):
@@ -249,25 +272,31 @@ class ServerCore:
 
                 conn.touch()
 
-                #verify signature if from server
+                # if from server, enforce signature using current model:
+                # if this sender is a pinned introducer, verify with introducer secret
+                # else try verify with this server's secret (demo HMAC model)
                 if conn.is_server:
-                    if not self.verify_signature(envelope):
-                        logging.warning("Dropping server frame with invalid signature from %s", conn.remote_id or "unknown")
-                        continue
+                    sender = envelope.get("from")
+                    if sender and sender in self.introducers:
+                        if not self.verify_signature_with_secret(envelope, self.introducers[sender]):
+                            logging.warning("Dropping frame with invalid signature from introducer %s", sender)
+                            continue
+                    else:
+                        if not self.verify_signature(envelope):
+                            logging.warning("Dropping server frame with invalid signature from %s", conn.remote_id or "unknown")
+                            continue
 
-                #duplicate suppression
+                # duplicate suppression
                 fid = self.envelope_fingerprint(envelope)
                 if fid in self.seen:
                     logging.debug("Dropping duplicate envelope %s from %s", envelope.get("type"), envelope.get("from"))
                     continue
-                #insert and maintain queue
                 self.seen.add(fid)
                 self.seen_q.append(fid)
-                if len(self.seen_q) == self.seen_q.maxlen: #auto eviction handled by deque(maxlen) but set is synced
+                if len(self.seen_q) == self.seen_q.maxlen:
                     if len(self.seen) > self.seen_q.maxlen:
                         self.seen = set(self.seen_q)
 
-                # handle envelope
                 await self.handle_envelope(conn, envelope)
         except ConnectionClosed:
             logging.info("Connection closed: %s", conn.remote_id or "client")
@@ -286,8 +315,17 @@ class ServerCore:
                     await self._send_raw(conn, hb)
                 if now - conn.last_recv > HEARTBEAT_TIMEOUT:
                     logging.warning("Connection timed out (no recv) for %s", conn.remote_id or "peer")
+                    # send ERROR: TIMEOUT before closing
+                    try:
+                        err = {"type": "ERROR", "from": self.server_id, "to": conn.remote_id or "*", "ts": now_ms(),
+                               "payload": {"reason": "TIMEOUT"}}
+                        err["sig"] = self.sign_envelope(err)
+                        await self._send_raw(conn, err)
+                        logging.info("Sent ERROR:TIMEOUT to %s", conn.remote_id or conn.uri or "peer")
+                    except Exception:
+                        logging.exception("Failed to send ERROR:TIMEOUT")
                     await conn.close()
-                    #schedule reconnect when address is known
+                    # schedule reconnect if we know addr
                     if conn.remote_id:
                         addr = self.server_addrs.get(conn.remote_id, {}).get("ws_uri")
                         if addr and conn.remote_id not in self._reconnect_tasks:
@@ -297,8 +335,7 @@ class ServerCore:
         except asyncio.CancelledError:
             pass
 
-
-    #dispatch the envelope
+    #dispatch envelope 
     async def handle_envelope(self, conn: PeerConnection, envelope: Dict[str, Any]):
         typ = envelope.get("type")
         if not typ:
@@ -320,6 +357,8 @@ class ServerCore:
             await self._handle_server_deliver(envelope)
         elif typ == "CLIENT_REGISTER":
             await self._handle_client_register(conn, envelope)
+        elif typ == "ERROR":
+            logging.info("Received ERROR frame from %s: %s", envelope.get("from"), envelope.get("payload"))
         else:
             logging.debug("Unhandled envelope type: %s", typ)
 
@@ -333,7 +372,6 @@ class ServerCore:
         async with self.lock:
             self.user_locations[uid] = {"server_id": sid, "ts": time.time()}
         logging.info("User advertised: %s @ %s", uid, sid)
-        #gossip onward
         await self.broadcast_to_servers(envelope)
 
     async def _handle_user_remove(self, envelope: Dict[str, Any]):
@@ -399,7 +437,6 @@ class ServerCore:
                 async with self.lock:
                     self.server_addrs[sid] = {"ws_uri": ws_uri}
             logging.info("Server announced: %s", sid)
-        #merge snapshot
         if "user_locations" in payload:
             snap = payload["user_locations"]
             async with self.lock:
@@ -408,16 +445,29 @@ class ServerCore:
                     if not existing or info.get("ts", 0) > existing.get("ts", 0):
                         self.user_locations[uid] = info
             logging.info("Merged user_locations snapshot from %s", sid)
-        #forward to others except origin
         await self.broadcast_to_servers(envelope, exclude=[conn.remote_id])
 
     async def _handle_server_welcome(self, conn: PeerConnection, envelope: Dict[str, Any]):
         payload = envelope.get("payload", {}) or {}
         sid = payload.get("server_id") or envelope.get("from")
+        # If welcome came from a pinned introducer, verify with its secret before accepting
+        sender = envelope.get("from")
+        if sender in self.introducers:
+            ok = self.verify_signature_with_secret(envelope, self.introducers[sender])
+            if not ok:
+                logging.warning("SERVER_WELCOME from pinned introducer %s failed signature check; rejecting", sender)
+                try:
+                    await conn.ws.close()
+                except Exception:
+                    pass
+                return
+            logging.info("Verified SERVER_WELCOME from pinned introducer %s", sender)
+        # register peer
         if sid:
             conn.remote_id = sid
             async with self.lock:
                 self.server_peers[sid] = conn
+        # merge snapshot if present
         snapshot = payload.get("snapshot") or {}
         user_snap = snapshot.get("user_locations", {}) if isinstance(snapshot, dict) else {}
         async with self.lock:
@@ -425,7 +475,7 @@ class ServerCore:
                 existing = self.user_locations.get(uid)
                 if not existing or info.get("ts", 0) > existing.get("ts", 0):
                     self.user_locations[uid] = info
-        logging.info("Processed SERVER_WELCOME from %s", sid)
+        logging.info("Processed SERVER_WELCOME from %s", sid or sender)
 
     async def _handle_server_deliver(self, envelope: Dict[str, Any]):
         payload = envelope.get("payload", {}) or {}
@@ -458,7 +508,6 @@ class ServerCore:
             logging.info("Forwarded SERVER_DELIVER for %s to %s", user_id, loc["server_id"])
 
     async def _handle_client_register(self, conn: PeerConnection, envelope: Dict[str, Any]):
-        #registration from local client connection
         if conn.is_server:
             return
         payload = envelope.get("payload", {}) or {}
@@ -479,7 +528,7 @@ class ServerCore:
         await self.broadcast_to_servers(adv)
 
 
-    #sending and broadcasting
+    # Sending and broadcasting
     async def _send_raw(self, conn: PeerConnection, envelope: Dict[str, Any]):
         try:
             await conn.ws.send(json.dumps(envelope))
@@ -510,35 +559,47 @@ class ServerCore:
                 continue
             await self._send_raw(conn, envelope)
 
-    #outbound connect and reconnect loop
+
+    # Outbound connect and reconnect loop
+
     async def connect_to_peer(self, uri: str, remote_server_id: Optional[str] = None):
         try:
             ws = await websockets.connect(uri)
             hello = {"type": "SERVER_HELLO_JOIN", "from": self.server_id, "to": "*", "ts": now_ms(),
                      "payload": {"ws_uri": uri}}
+            # sign HELLO with this server's secret
             hello["sig"] = self.sign_envelope(hello)
             await ws.send(json.dumps(hello))
 
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             msg = json.loads(raw)
 
-            #verify signature
-            if not self.verify_signature(msg):
-                logging.warning("Received SERVER_WELCOME with invalid sig from %s. Closing.", uri)
-                await ws.close()
-                return None
+            # If the welcome is from a pinned introducer, verify using introducer secret
+            sender = msg.get("from")
+            if sender in self.introducers:
+                ok = self.verify_signature_with_secret(msg, self.introducers[sender])
+                if not ok:
+                    logging.warning("Received SERVER_WELCOME from pinned introducer %s with invalid sig; closing", sender)
+                    await ws.close()
+                    return None
+                logging.info("Verified SERVER_WELCOME signature from introducer %s", sender)
+
+            # otherwise, if message had sig verify with our model (best-effort)
+            else:
+                if not self.verify_signature(msg):
+                    logging.warning("SERVER_WELCOME signature invalid or missing; rejecting connection to %s", uri)
+                    await ws.close()
+                    return None
 
             conn = PeerConnection(ws, is_server=True, remote_id=(msg.get("from") or remote_server_id), uri=uri)
             async with self.lock:
                 self.connections[ws] = conn
                 if conn.remote_id:
                     self.server_peers[conn.remote_id] = conn
-                    #store address
                     self.server_addrs[conn.remote_id] = {"ws_uri": uri}
-            #process welcome envelope to merge snapshot
+            # process welcome to merge snapshot
             await self.handle_envelope(conn, msg)
 
-            #start tasks
             conn._recv_task = asyncio.create_task(self.receive_loop(conn))
             conn._heartbeat_task = asyncio.create_task(self.heartbeat_loop(conn))
             logging.info("Connected to peer %s at %s", conn.remote_id or uri, uri)
@@ -567,21 +628,20 @@ class ServerCore:
         except asyncio.CancelledError:
             logging.info("Reconnect loop canceled for %s", key)
         finally:
-            #task entry cleanup
             if expected_server_id and expected_server_id in self._reconnect_tasks:
                 del self._reconnect_tasks[expected_server_id]
             elif key in self._reconnect_tasks:
                 self._reconnect_tasks.pop(key, None)
 
 
-    #cleanup and status
+    # Cleanup and status
+
     async def cleanup_connection(self, conn: PeerConnection):
         async with self.lock:
             self.connections.pop(conn.ws, None)
             if conn.remote_id and self.server_peers.get(conn.remote_id) is conn:
                 del self.server_peers[conn.remote_id]
 
-            #remove local clients served on this ws
             to_remove = [uid for uid, ws in self.local_clients.items() if ws is conn.ws]
             for uid in to_remove:
                 logging.info("Cleaning up local client %s", uid)
@@ -598,26 +658,44 @@ class ServerCore:
             "known_users": list(self.user_locations.keys()),
             "known_servers": list(self.server_peers.keys()),
             "local_clients": list(self.local_clients.keys()),
-            "reconnect_tasks": list(self._reconnect_tasks.keys())
+            "reconnect_tasks": list(self._reconnect_tasks.keys()),
+            "pinned_introducers": list(self.introducers.keys())
         }
 
 
+# -------------------------
+# CLI / main
+# -------------------------
+def parse_introducers(args_list: List[str]) -> Dict[str, str]:
+    """
+    Parse introducer tokens like: id=secret
+    Accepts a list of such strings.
+    """
+    out = {}
+    for it in args_list or []:
+        if "=" in it:
+            k, v = it.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k and v:
+                out[k] = v
+    return out
 
-#main
-async def main_loop(host: str, port: int, server_id: str, secret: str, peers: list):
-    core = ServerCore(server_id, secret)
 
-    #accepts both ws,path and ws
-    async def ws_handler(ws, path=None): 
+async def main_loop(host: str, port: int, server_id: str, secret: str, peers: list, introducers: Dict[str, str]):
+    if len(introducers) < 3:
+        logging.warning("Introducer list has fewer than 3 entries — spec recommends ≥3 pinned introducers for trust root.")
+    core = ServerCore(server_id, secret, introducers)
+
+    async def ws_handler(ws, path=None):
         await core.handler(ws, path)
 
     server = await websockets.serve(ws_handler, host, port)
     logging.info("server listening on %s:%s", host, port)
     logging.info("Server %s listening on %s:%s", server_id, host, port)
 
-    #start outbound reconnect loops for configured peers
+    # start outbound reconnect loops for configured peers
     for p in peers or []:
-        #uri as the reconnect task key 
         if p not in core._reconnect_tasks:
             core._reconnect_tasks[p] = asyncio.create_task(core._reconnect_loop(p, expected_server_id=None))
 
@@ -629,6 +707,7 @@ async def main_loop(host: str, port: int, server_id: str, secret: str, peers: li
             logging.info("Known servers: %s", st["known_servers"])
             logging.info("Local clients: %s", st["local_clients"])
             logging.info("Reconnect tasks: %s", st["reconnect_tasks"])
+            logging.info("Pinned introducers: %s", st["pinned_introducers"])
 
     await status_printer()
 
@@ -640,10 +719,12 @@ if __name__ == "__main__":
     ap.add_argument("--server-id", required=True)
     ap.add_argument("--secret", required=True)
     ap.add_argument("--peers", nargs="*", help="Peer websocket URIs to connect to, e.g. ws://127.0.0.1:8766")
+    ap.add_argument("--introducers", nargs="*", help="Pinned introducers as id=secret pairs (e.g. i1=s3,i2=s4,i3=s5)")
     args = ap.parse_args()
 
+    introducers = parse_introducers(args.introducers or [])
     try:
-        asyncio.run(main_loop(args.host, args.port, args.server_id, args.secret, args.peers or []))
+        asyncio.run(main_loop(args.host, args.port, args.server_id, args.secret, args.peers or [], introducers))
     except KeyboardInterrupt:
         logging.info("Shutting down")
         try:
