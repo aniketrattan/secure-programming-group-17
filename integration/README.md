@@ -1,110 +1,170 @@
-# Secure Overlay Chat Protocol (SOCP) – Integration Guide
+# 🔐 Secure Overlay Chat Protocol (SOCP) – Implementation
 
-This folder contains a reference implementation of the SOCP server and client with end-to-end encrypted DMs, a persisted public channel, file transfer, presence gossip, and server-to-server routing over WebSockets.
+> **A decentralized, end-to-end encrypted messaging system with server-to-server routing over WebSockets**
 
-## Installation
+---
+
+## 🚀 Quick Start
+
+### Installation
 
 Install Python dependencies:
 
-```cmd
-python -m pip install -r integration\requirements.txt
+```bash
+pip install -r requirements.txt
 ```
 
-## Running servers (multi-node mesh)
+### 🏗️ Server Setup (Introducer Architecture)
 
-SOCP requires a UUID v4 for each server. Use different ports for each server.
+SOCP uses an **introducer-based bootstrap** system where the first server acts as an introducer and assigns UUIDs to subsequent servers.
 
-1) Generate two UUIDs:
-```cmd
-python -c "import uuid; print(uuid.uuid4()); print(uuid.uuid4())"
+#### 1️⃣ Start the Introducer Server
+```bash
+python run_server.py --bind ws://127.0.0.1:8765 --server-id auto
+```
+> The first server with `--server-id auto` becomes the introducer and gets assigned a UUID automatically.
+
+#### 2️⃣ Start Additional Servers
+```bash
+python run_server.py --bind ws://127.0.0.1:8766 --server-id auto --peer ws://127.0.0.1:8765
+python run_server.py --bind ws://127.0.0.1:8767 --server-id auto --peer ws://127.0.0.1:8765
 ```
 
-2) Start server A on 8765:
-```cmd
-python -m integration.run_server --bind ws://127.0.0.1:8765 --server-id <UUID_A>
+**Expected Behavior:**
+- ✅ Introducer assigns UUIDs to new servers automatically
+- ✅ Servers announce themselves to the mesh network
+- ✅ Cross-server routing establishes automatically
+- ✅ Periodic status shows all servers in "Known servers"
+
+> **💡 Note:** Use different ports for each server.
+
+### 👥 Client Setup
+
+Start clients connected to different servers to test cross-server messaging:
+
+**Client 1 (connected to Server A):**
+```bash
+python run_client.py --server ws://127.0.0.1:8765
 ```
 
-3) Start server B on 8766 and peer to A:
-```cmd
-python -m integration.run_server --bind ws://127.0.0.1:8766 --server-id <UUID_B> --peer ws://127.0.0.1:8765
+**Client 2 (connected to Server B):**
+```bash
+python run_client.py --server ws://127.0.0.1:8766
 ```
 
-Expected logs:
-- Server B: “Connected to peer ws://127.0.0.1:8765”.
-- Server A: “Server joining …”, then “Server announced: <UUID_B>”.
-- Periodic status shows both in “Known servers”.
+---
 
-Notes:
-- Use different ports for each server; peering to the same port you’re bound on won’t work.
+## 💬 Client Commands & Features
 
-## Running clients
+All commands are typed directly in the client terminal.
 
-Start one client per server to test cross-server routing.
+### 🔐 Authentication
 
-Client 1 (to A):
-```cmd
-python -m integration.run_client --server ws://127.0.0.1:8765
-```
+#### `/register`
+Creates a new user account with RSA-4096 keypair generation.
+- Generates and stores a protected private key
+- Prompts for password (protects private key at rest)
+- Returns your new user UUID
+- After registration, you need to claim a username for easier identification
 
-Client 2 (to B):
-```cmd
-python -m integration.run_client --server ws://127.0.0.1:8766
-```
+#### `/login <username_or_uuid>`
+Authenticates with your existing account using either:
+- **Username**: `alice`, `bob`, `charlie` (case-insensitive)
+- **UUID**: Full UUID v4 format
+- Recovers your private key using your password
+- Sends `USER_HELLO` to attach presence
+- Shows `[LOGIN SUCCESS]` on successful authentication
 
-## Client commands (features)
+### 👥 User Management
 
-All commands are typed in the client terminal.
+#### `/list`
+Lists all online users across the entire server mesh.
+- Returns sorted list of usernames
+- Updates via presence gossip from all servers
+- Shows users from any connected server
+- **Example**: `Online users: alice, bob, charlie`
 
-### 1) Register (generates keys, stores a protected private key)
-```
-/register
-```
-You’ll be shown your new user UUID and prompted to set a password (used to protect your private key at rest).
+### 💌 Messaging
 
-### 2) Login
-```
-/login <user_uuid>
-```
-On success, you’ll see `[LOGIN SUCCESS]`. The client recovers your private key and sends `USER_HELLO` to attach presence.
+#### `/tell <recipient> <message>`
+Sends an **end-to-end encrypted** direct message.
+- **Recipient**: Can be username (`alice`) or UUID
+- Encrypts with recipient's RSA-4096 public key
+- Signs content with your private key
+- Server verifies signature and drops malformed messages
+- Recipient sees: `DM from <sender_username>: <message>`
 
-### 3) List online users
-```
-/list
-```
-Returns a sorted list of online user UUIDs (across servers, via gossip).
+#### `/all <message>`
+Broadcasts to the **public channel** (all users).
+- Per-member RSA encryption with content signatures
+- Server never decrypts; forwards to each member's hosting server
+- Public channel version persists and increments on join/leave
+- Message reaches all users across the entire mesh
 
-### 4) Direct message (DM, end-to-end encrypted)
-```
-/tell <recipient_uuid> <message>
-```
-Behavior:
-- Client encrypts with recipient’s RSA-4096 pubkey and signs content.
-- Server verifies DM `content_sig` and drops malformed messages early.
-- Recipient sees: `DM from <sender_uuid>: <text>`.
+### 📁 File Transfer
 
-### 5) Public channel (broadcast)
-```
-/all <text>
-```
-Behavior:
-- Per-member RSA encryption and content signatures.
-- Server does not decrypt; fans out to each member’s hosting server.
-- Public channel version is persisted and bumps on join/leave.
+#### `/file <recipient> <path_to_file>`
+Transfers files securely with chunked encryption.
+- **Recipient**: Can be username (`alice`) or UUID
+- Sends `FILE_START` → `FILE_CHUNK(s)` → `FILE_END`
+- Each chunk is RSA-OAEP encrypted and signed
+- Server/client verify timestamps and signatures
+- Recipient saves as `received_<file_id>` when complete
 
-### 6) File transfer
-```
-/file <recipient_uuid> <path_to_file>
-```
-Behavior:
-- Sends FILE_START → FILE_CHUNK(s) → FILE_END.
-- Each chunk is RSA-OAEP encrypted and signed; server/client verify timestamps and signatures.
-- Recipient writes `received_<file_id>` when complete.
+---
 
+## 🧪 Testing Guide
 
-## Quick test recipe
+### Complete Test Workflow
 
-1) Start two servers (UUID v4 IDs) on 8765 and 8766, peering B→A.
-2) Start one client per server; `/register` then `/login` on both.
-3) Run `/list` on either client – both UUIDs should appear.
-4) Send `/tell <other_uuid> hello` and `/all hello-public`.
-5) Try `/file <other_uuid> <a_small_file>` and check recipient output.
+1. **🏗️ Start Server Mesh**
+   ```bash
+   # Terminal 1: Start introducer
+   python run_server.py --bind ws://127.0.0.1:8765 --server-id auto
+   
+   # Terminal 2: Start additional server
+   python run_server.py --bind ws://127.0.0.1:8766 --server-id auto --peer ws://127.0.0.1:8765
+   ```
+
+2. **👥 Start Clients**
+   ```bash
+   # Terminal 3: Client 1
+   python run_client.py --server ws://127.0.0.1:8765
+   
+   # Terminal 4: Client 2  
+   python run_client.py --server ws://127.0.0.1:8766
+   ```
+
+3. **🔐 Register & Login**
+   ```bash
+   # In Client 1 terminal:
+   /register
+   /login <your_uuid_or_username_from_register>
+   
+   # In Client 2 terminal:
+   /register
+   /login <your_uuid_or_username_from_register>
+   ```
+
+4. **✅ Verify Cross-Server Communication**
+   ```bash
+   # Check both users are visible (shows usernames)
+   /list
+   
+   # Send encrypted DM using usernames
+   /tell alice Hello from across servers!
+   
+   # Send public message
+   /all Testing public channel across mesh!
+   
+   # Test file transfer using usernames
+   /file alice test.txt
+   ```
+
+### 🎯 Expected Results
+- ✅ Both usernames appear in `/list` from either client
+- ✅ Direct messages delivered with `DM from <username>: <message>` format
+- ✅ Public messages broadcast to all users
+- ✅ File transfers complete with `received_<file_id>` files
+
+---

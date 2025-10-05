@@ -33,8 +33,10 @@ colorama_init(autoreset=True)
 # Config
 # -------------------------
 SCROLLBACK = 500
-LOGFILE = "chat_client.log"
-SENT_DIR = Path("sent")
+# Log file in integration folder
+integration_dir = os.path.dirname(os.path.abspath(__file__))
+LOGFILE = os.path.join(integration_dir, "chat_client.log")
+SENT_DIR = Path(integration_dir) / "sent"
 SENT_DIR.mkdir(exist_ok=True)
 USER_ID = os.environ.get("CHAT_USER", "localuser")
 
