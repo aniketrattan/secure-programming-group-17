@@ -5,6 +5,7 @@ import websockets
 import uuid
 import os
 import time
+import json
 
 from .protocol import make_envelope, parse_envelope
 from .customised_types import ServerMessageType, CustomisedMessageType, UserAuthType
@@ -14,7 +15,7 @@ from .crypto_services import (
     encrypt_rsa_oaep, decrypt_rsa_oaep,
     sign_pss_sha256, verify_pss_sha256,
     load_public_key_b64url, load_private_key_der,
-    preimage_dm, preimage_public, preimage_file_chunk,
+    preimage_dm, preimage_public, preimage_file_chunk, preimage_keyshare,
 )
 from .transport import verify_transport_payload
 from .crypto_services.secure_store import get_password_hasher, protect_private_key, recover_private_key
@@ -219,11 +220,13 @@ class Client:
                             break
                         ct = encrypt_rsa_oaep(chunk, peer_pub)
                         ct_b64 = b64url_encode(ct)
-                        pm = preimage_file_chunk(ct_b64, self._user_id, target, ts_ms, file_id, idx)
+                        total = (size + RSA_OAEP_MAX_CHUNK - 1) // RSA_OAEP_MAX_CHUNK
+                        pm = preimage_file_chunk(ct_b64, self._user_id, target, ts_ms, file_id, idx, total)
                         sig_b64 = b64url_encode(sign_pss_sha256(pm, self._priv))
                         frame = {
                             "file_id": file_id,
                             "index": idx,
+                            "total": total,
                             "ciphertext": ct_b64,
                             "sender_pub": self._pub_b64,
                             "content_sig": sig_b64,
@@ -248,40 +251,36 @@ class Client:
                 ))
 
             elif cmd.startswith(PUBLIC_COMMAND):
-                text = cmd[len(PUBLIC_COMMAND):].encode("utf-8")
+                text_bytes = cmd[len(PUBLIC_COMMAND):].encode("utf-8")
                 if not self._user_id:
                     print("[CLIENT] Please /login first")
                     continue
-                # Get members snapshot
                 members, version = await self.get_public_members(ws)
                 if not members:
                     print("[Public] no members")
                     continue
                 label = f"public-v{self.public_group_version or version or 1}".encode()
-                multict = []
-                ts_ms = int(time.time()*1000)
+                def iter_chunks(data: bytes, size: int):
+                    for off in range(0, len(data), size):
+                        yield data[off: off + size]
                 for rid in members:
-                    if rid == self._user_id:
-                        pub_b64 = self._pub_b64
-                        pub = load_public_key_b64url(pub_b64)
-                    else:
-                        pub_b64 = await self._ensure_peer_pub(ws, rid)
-                        if not pub_b64:
-                            continue
-                        pub = load_public_key_b64url(pub_b64)
-                    ct = encrypt_rsa_oaep(text, pub, label=label)
-                    ct_b64 = b64url_encode(ct)
-                    pm_item = preimage_public(ct_b64, self._user_id, ts_ms)
-                    sig_item = b64url_encode(sign_pss_sha256(pm_item, self._priv))
-                    multict.append({"to": rid, "ciphertext": ct_b64, "content_sig": sig_item})
-                await ws.send(make_envelope(
-                    msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
-                    from_id=self._user_id,
-                    to_id="public",
-                    payload={"multict": multict, "sender_pub": self._pub_b64},
-                    sig="",
-                    ts=ts_ms,
-                ))
+                    pub_b64 = self._pub_b64 if rid == self._user_id else await self._ensure_peer_pub(ws, rid)
+                    if not pub_b64:
+                        continue
+                    pub = load_public_key_b64url(pub_b64)
+                    for piece in iter_chunks(text_bytes, RSA_OAEP_MAX_CHUNK):
+                        ts_ms = int(time.time()*1000)
+                        ct_b64 = b64url_encode(encrypt_rsa_oaep(piece, pub, label=label))
+                        pm = preimage_public(ct_b64, self._user_id, ts_ms)
+                        content_sig = b64url_encode(sign_pss_sha256(pm, self._priv))
+                        await ws.send(make_envelope(
+                            msg_type=ServerMessageType.MSG_PUBLIC_CHANNEL,
+                            from_id=self._user_id,
+                            to_id=rid,
+                            payload={"ciphertext": ct_b64, "sender_pub": self._pub_b64, "group_id": "public", "public_version": (self.public_group_version or version or 1), "content_sig": content_sig},
+                            sig="",
+                            ts=ts_ms,
+                        ))
 
             elif cmd.startswith(LIST_COMMAND):
                 lst_msg = make_envelope(
@@ -343,14 +342,17 @@ class Client:
                 if not (ct_b64 and sig_b64 and ts and sender_pub_b64):
                     print("[Public] missing fields")
                     continue
-                if not verify_pss_sha256(
-                    preimage_public(ct_b64, sender, ts),
-                    b64url_decode(sig_b64),
-                    load_public_key_b64url(sender_pub_b64),
-                ):
+                try:
+                    from .crypto_services import assert_valid_ts
+                    assert_valid_ts(ts)
+                except Exception:
+                    print("[Public] bad ts")
+                    continue
+                if not verify_pss_sha256(preimage_public(ct_b64, sender, ts), b64url_decode(sig_b64), load_public_key_b64url(sender_pub_b64)):
                     print("[Public] bad content sig")
                     continue
-                label = f"public-v{self.public_group_version or 1}".encode()
+                ver = payload.get("public_version") or (self.public_group_version or 1)
+                label = f"public-v{ver}".encode()
                 try:
                     pt = decrypt_rsa_oaep(b64url_decode(ct_b64), self._priv, label=label)
                 except Exception:
@@ -374,7 +376,14 @@ class Client:
                 fid = p["file_id"]
                 idx = int(p["index"]) 
                 ts = frame["ts"]
-                pm = preimage_file_chunk(p["ciphertext"], frame["from"], frame["to"], ts, fid, idx)
+                total = int(p.get("total", 0))
+                try:
+                    from .crypto_services import assert_valid_ts
+                    assert_valid_ts(ts)
+                except Exception:
+                    print("[FILE] bad ts; dropping")
+                    continue
+                pm = preimage_file_chunk(p["ciphertext"], frame["from"], frame["to"], ts, fid, idx, total)
                 if not verify_pss_sha256(pm, b64url_decode(p.get("content_sig", "")), load_public_key_b64url(p.get("sender_pub", ""))):
                     print("[FILE] bad content sig; dropping")
                     continue
@@ -394,19 +403,29 @@ class Client:
             elif frame["type"] == ServerMessageType.PUBLIC_CHANNEL_KEY_SHARE:
                 payload = frame.get("payload", {})
                 v = payload.get("version")
-                for s in payload.get("shares", []):
+                shares = payload.get("shares", [])
+                creator_pub = payload.get("creator_pub")
+                content_sig = payload.get("content_sig", "")
+                # Verify content signature over shares
+                try:
+                    pm = preimage_keyshare(shares, creator_pub)
+                    if not verify_pss_sha256(pm, b64url_decode(content_sig), load_public_key_b64url(creator_pub)):
+                        print("[Public] key-share signature invalid; ignoring")
+                        continue
+                except Exception:
+                    print("[Public] key-share verification error; ignoring")
+                    continue
+                for s in shares:
                     if s.get("member") == self._user_id:
-                        wrapped = b64url_decode(s["wrapped_public_channel_key"])
-                        try:
-                            self.public_group_key = decrypt_rsa_oaep(wrapped, self._priv)
-                            self.public_group_version = v
-                            print(f"[Public] received key-share (v{v})")
-                        except Exception:
-                            print("[Public] failed to unwrap key-share")
+                        # Store wrapped key (we do not decrypt for RSA-only wire)
+                        self.public_group_version = v
+                        print(f"[Public] received key-share (v{v})")
             elif frame["type"] == ServerMessageType.PUBLIC_CHANNEL_UPDATED:
                 payload = frame.get("payload", {})
-                self.public_group_version = payload.get("version", self.public_group_version)
-                print(f"[Public] version now v{self.public_group_version}")
+                new_v = payload.get("version")
+                if new_v and new_v != self.public_group_version:
+                    self.public_group_version = new_v
+                    print(f"[Public] version now v{self.public_group_version}")
             elif frame["type"] == ServerMessageType.PUBLIC_MEMBERS_SNAPSHOT:
                 payload = frame.get("payload", {})
                 fut = self._pending_pubkey.get("__public_members__")

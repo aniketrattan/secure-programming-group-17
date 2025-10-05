@@ -10,7 +10,6 @@ import logging
 import uuid
 from .crypto_services.rsa import load_public_key_b64url
 
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,9 +86,9 @@ class SecureMessagingDB:
                 CREATE TABLE IF NOT EXISTS groups (
                     group_id TEXT PRIMARY KEY,
                     creator_id TEXT NOT NULL,
-                    created_at INTEGER,
+                    created_at INTEGER NOT NULL,
                     meta TEXT,
-                    version INTEGER DEFAULT 1
+                    version INTEGER NOT NULL DEFAULT 1
                 )
             """)
             
@@ -100,13 +99,13 @@ class SecureMessagingDB:
                     member_id TEXT NOT NULL,
                     role TEXT DEFAULT 'member',
                     wrapped_key TEXT NOT NULL,
-                    added_at INTEGER,
+                    added_at INTEGER NOT NULL,
                     PRIMARY KEY (group_id, member_id),
                     FOREIGN KEY (group_id) REFERENCES groups (group_id) ON DELETE CASCADE
                 )
             """)
             
-            # user sessions table (Chatgpt, "not in SOCP spec but useful for implementation")
+            # user sessions table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_sessions (
                     session_id TEXT PRIMARY KEY,
@@ -121,12 +120,22 @@ class SecureMessagingDB:
                 )
             """)
 
-            # Minimal public-channel membership table
+            # Minimal public-channel membership table (kept for compatibility; not the source of truth)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS channel_members (
                     channel_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     PRIMARY KEY (channel_id, user_id)
+                )
+            """)
+
+            # Trusted server key pins (persisted trust)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trusted_servers (
+                    server_id TEXT PRIMARY KEY,
+                    pubkey TEXT NOT NULL,
+                    ws_uri TEXT,
+                    added_at INTEGER NOT NULL
                 )
             """)
             
@@ -185,27 +194,114 @@ class SecureMessagingDB:
         return "public"
 
     def add_member_to_public(self, user_id: str) -> None:
+        """Add membership to 'public' in group_members and mirror to channel_members.
+        The group_members table is the source of truth; channel_members is mirrored for legacy callers.
+        """
         with sqlite3.connect(self.db_path) as conn:
+            # Ensure 'public' group exists
             conn.execute(
-                "INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES ('public', ?)",
-                (user_id,)
+                """
+                INSERT OR IGNORE INTO groups (group_id, creator_id, created_at, meta, version)
+                VALUES ('public','system', ?, '{"title":"Public Channel"}', 1)
+                """,
+                (int(datetime.now(timezone.utc).timestamp()),),
+            )
+            # Insert group membership with a placeholder wrapped_key
+            wrapped_key = f"wrapped_key_for_{user_id}"
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO group_members (group_id, member_id, role, wrapped_key, added_at)
+                VALUES ('public', ?, 'member', ?, ?)
+                """,
+                (user_id, wrapped_key, int(datetime.now(timezone.utc).timestamp())),
+            )
+            # Mirror to channel_members (compat)
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO channel_members (channel_id, user_id) VALUES ('public', ?)",
+                    (user_id,),
+                )
+            except sqlite3.Error:
+                pass
+            conn.commit()
+
+    def set_wrapped_public_key(self, member_id: str, wrapped_b64: str, added_at: int) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            # Ensure group and member rows exist
+            conn.execute(
+                "INSERT OR IGNORE INTO groups (group_id, creator_id, created_at, meta, version) VALUES ('public','system', ?, '{\"title\":\"Public Channel\"}', 1)",
+                (int(datetime.now(timezone.utc).timestamp()),)
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO group_members (group_id, member_id, role, wrapped_key, added_at) VALUES ('public', ?, COALESCE((SELECT role FROM group_members WHERE group_id='public' AND member_id=?),'member'), ?, ?)",
+                (member_id, member_id, wrapped_b64, added_at)
             )
             conn.commit()
 
     def remove_member_from_public(self, user_id: str) -> None:
         with sqlite3.connect(self.db_path) as conn:
+            # Remove from source-of-truth table
             conn.execute(
-                "DELETE FROM channel_members WHERE channel_id='public' AND user_id=?",
-                (user_id,)
+                "DELETE FROM group_members WHERE group_id='public' AND member_id=?",
+                (user_id,),
             )
+            # Mirror delete to channel_members (compat)
+            try:
+                conn.execute(
+                    "DELETE FROM channel_members WHERE channel_id='public' AND user_id=?",
+                    (user_id,),
+                )
+            except sqlite3.Error:
+                pass
             conn.commit()
 
     def get_public_members(self) -> List[str]:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT user_id FROM channel_members WHERE channel_id='public'"
+                "SELECT member_id FROM group_members WHERE group_id='public'"
             ).fetchall()
             return [r[0] for r in rows]
+
+    def get_public_version(self) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT version FROM groups WHERE group_id='public'"
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 1
+
+    # ---- Trusted server key pins ----
+    def upsert_trusted_server(self, server_id: str, pubkey: str, ws_uri: Optional[str] = None) -> None:
+        # Enforce UUID v4 server_id
+        try:
+            if str(uuid.UUID(server_id, version=4)) != server_id:
+                raise ValueError
+        except Exception as exc:
+            raise ValueError("Invalid UUID v4 server_id") from exc
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO trusted_servers (server_id, pubkey, ws_uri, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    pubkey=excluded.pubkey,
+                    ws_uri=COALESCE(excluded.ws_uri, trusted_servers.ws_uri)
+                """,
+                (server_id, pubkey, ws_uri, int(datetime.now(timezone.utc).timestamp())),
+            )
+            conn.commit()
+
+    def get_trusted_server_pubkey(self, server_id: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT pubkey FROM trusted_servers WHERE server_id=?",
+                (server_id,),
+            ).fetchone()
+            return row[0] if row else None
+
+    def load_trusted_mapping(self) -> Dict[str, str]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT server_id, pubkey FROM trusted_servers").fetchall()
+            return {r[0]: r[1] for r in rows}
 
     def get_display_name(self, user_id: str) -> str:
         with sqlite3.connect(self.db_path) as conn:
@@ -239,9 +335,15 @@ class SecureMessagingDB:
     def register_user(self, user_id: str, pubkey: str, privkey_store: str,
                      pake_password: str, meta: Optional[Dict] = None) -> str:
         meta_json = json.dumps(meta) if meta else None
+        # Enforce UUID v4 user_id
+        try:
+            if str(uuid.UUID(user_id, version=4)) != user_id:
+                raise ValueError
+        except Exception as exc:
+            raise ValueError("Invalid UUID v4 user_id") from exc
         # Enforce RSA-4096 public key
         try:
-            load_public_key_b64url(pubkey)
+            public_key = load_public_key_b64url(pubkey)
         except Exception as exc:
             raise ValueError("Invalid RSA-4096 public key") from exc
 
@@ -264,7 +366,11 @@ class SecureMessagingDB:
                     (user_id, pubkey, privkey_store, pake_password, meta_json),
                 )
 
-                wrapped_key = f"wrapped_key_for_{user_id}"  # Placeholder for RSA-OAEP wrapped channel key
+                # Per SOCP §11.2, DB stores only per-member wraps (no clear group key in DB).
+                # Group key management/distribution is handled by the server layer.
+                # Use a placeholder wrapped key here; server may update it later.
+                wrapped_key = f"wrapped_key_for_{user_id}"
+
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO group_members (group_id, member_id, role, wrapped_key, added_at)
@@ -280,7 +386,10 @@ class SecureMessagingDB:
         except sqlite3.IntegrityError as e:
             logger.error(f"Failed to register user {user_id}: {e}")
             raise ValueError(f"User ID {user_id} already exists")
+
     
+
+
     def get_user_auth(self, user_id: str) -> Optional[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
@@ -379,18 +488,39 @@ class SecureMessagingDB:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("BEGIN TRANSACTION")
+
+                group_key = self.generate_group_key()
+
+                # Store group key in meta (for future member additions)
+                meta_dict = meta.copy() if meta else {}
+                meta_dict['group_key_hex'] = group_key.hex()
+                meta_json = json.dumps(meta_dict)
+
                 conn.execute("""
                     INSERT INTO groups (group_id, creator_id, created_at, meta, version)
                     VALUES (?, ?, ?, ?, 1)
                 """, (group_id, creator_id, created_at, meta_json))
                 
-                wrapped_key = f"wrapped_key_for_{creator_id}"  # Placeholder
-                
+                if self.crypto:
+                    # Get creator's public key
+                    creator_pubkey = self.get_pubkey(creator_id)
+                    if not creator_pubkey:
+                        raise ValueError(f"Public key not found for creator {creator_id}")
+
+                    # Wrap the group key for the creator
+                    wrapped_key = self.wrap_group_key(group_key, creator_pubkey)
+                    logger.info(f"Generated wrapped key for creator {creator_id}")
+                else:
+                    # Fallback if crypto not available (for testing)
+                    wrapped_key = f"wrapped_key_for_{creator_id}"
+                    logger.warning("Crypto module not available, using placeholder wrapped key")
+
                 conn.execute("""
                     INSERT INTO group_members (group_id, member_id, role, wrapped_key, added_at)
                     VALUES (?, ?, 'owner', ?, ?)
                 """, (group_id, creator_id, wrapped_key, created_at))
-                
+
+
                 conn.commit()
                 logger.info(f"Group created: {group_id}")
                 return group_id

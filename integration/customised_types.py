@@ -24,3 +24,12 @@ class UserAuthType(str, Enum):
     LOGIN_SUCCESS = "LOGIN_SUCCESS"
     LOGIN_FAIL = "LOGIN_FAIL"
 
+
+class ErrorCode(str, Enum):
+    BAD_KEY = "BAD_KEY"
+    INVALID_SIG = "INVALID_SIG"
+    USER_NOT_FOUND = "USER_NOT_FOUND"
+    UNKNOWN_TYPE = "UNKNOWN_TYPE"
+    TIMEOUT = "TIMEOUT"
+    NAME_IN_USE = "NAME_IN_USE"
+
