@@ -1,5 +1,0 @@
-integration/__pycache__/
-integration/venv/
-integration/crypto_services/__pycache__/
-*.pyc
-socp.md
