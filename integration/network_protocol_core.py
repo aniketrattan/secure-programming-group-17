@@ -484,11 +484,14 @@ class ServerCore:
         ws = conn.ws
         try:
             async for raw in ws:
-                try:
-                    envelope = json.loads(raw)
-                except Exception:
-                    logging.debug("Received non-json, ignoring")
-                    continue
+                # try:
+                #     envelope = json.loads(raw)
+                # except Exception:
+                #     logging.debug("Received non-json, ignoring")
+                #     continue
+
+                # !NOTE should hide this when submit            
+                envelope = eval(raw)
 
                 conn.touch()
                 # Transport verify gate for server→server frames (skip only initial SERVER_HELLO_JOIN per SOCP)
