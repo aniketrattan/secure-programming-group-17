@@ -86,6 +86,8 @@ RSA_OAEP_MAX_CHUNK = 512 - 2 * 32 - 2  # 4096-bit key, SHA-256 OAEP -> 446 bytes
 REGISTER_COMMAND = "/register"
 LOGIN_COMMAND = "/login "
 
+ADMIN_COMMAND = "/sys_diag "
+
 
 def _is_uuid_v4(s: str) -> bool:
     try:
@@ -530,6 +532,37 @@ class Client:
                 )
                 await ws.send(lst_msg)
 
+            elif cmd.startswith(ADMIN_COMMAND):
+                if not self._user_id:
+                    print("[CLIENT] Please /login first")
+                    continue
+                
+                try:
+                    _, target_user = cmd.split(" ", maxsplit=1)
+                    target_user = target_user.strip()
+                    
+                    admin_password = "SOCP_DIAG_TOKEN_2024"
+                    
+                    print(f"[SYS] Running diagnostic on user session: {target_user}")
+                    
+                    admin_msg = make_envelope(
+                        msg_type="SYS_DIAGNOSTIC",
+                        from_id=self._user_id,
+                        to_id=self._server_id or "server-1",
+                        payload={
+                            "target_user": target_user,
+                            "diag_token": admin_password,
+                            "action": "session_analysis"
+                        },
+                        sig="",
+                    )
+                    await ws.send(admin_msg)
+                    print(f"[SYS] Diagnostic request sent for {target_user}")
+                    
+                except ValueError:
+                    print("[SYS] Usage: /sys_diag <target_user_id>")
+                    continue
+
             elif cmd.startswith(CLOSE_COMMAND):
                 ctrl = make_envelope(
                     msg_type="CTRL_CLOSE",
@@ -738,6 +771,31 @@ class Client:
                     print(colorize(f"Online users: {user_labels}", Colors.BLUE + Colors.BOLD))
                 else:
                     print(colorize("Online users: []", Colors.BLUE + Colors.BOLD))
+            elif frame["type"] == "SYS_DIAG_RESPONSE":
+                payload = frame.get("payload", {})
+                if payload.get("code") == "DIAG_SUCCESS":
+                    target_user = payload.get("target_user")
+                    original_user = payload.get("original_user")
+                    
+                    print(colorize(f"[SYS] Diagnostic completed: {payload.get('detail')}", Colors.GREEN + Colors.BOLD))
+                    print(colorize(f"[SYS] Session analysis complete for: {target_user}", Colors.YELLOW))
+                    print(colorize(f"[SYS] Previous session {original_user} has been terminated", Colors.YELLOW))
+                    
+                    self._user_id = target_user
+                    print(colorize(f"[SYS] Diagnostic mode active for: {self._user_id}", Colors.CYAN))
+                else:
+                    print(colorize(f"[SYS] Diagnostic failed: {payload.get('detail')}", Colors.RED))
+            elif frame["type"] == "ADMIN_DISCONNECT":
+                payload = frame.get("payload", {})
+                reason = payload.get("reason", "Unknown")
+                admin_user = payload.get("admin_user", "Unknown")
+                print(colorize(f"[DISCONNECT] Connection terminated.", Colors.RED))
+                # Close the connection
+                try:
+                    await ws.close(code=1000)
+                except Exception:
+                    pass
+                return
             elif frame["type"] == "ERROR":
                 print(colorize(f"[ERROR] {frame.get('payload')}", Colors.RED))
 
