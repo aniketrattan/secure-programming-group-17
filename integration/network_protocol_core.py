@@ -11,24 +11,24 @@ from typing import Any, Dict, Optional
 import websockets
 from websockets.server import WebSocketServerProtocol
 
-from .crypto_services.base64url import b64url_decode, b64url_encode
-from .crypto_services.canonical import (
+from crypto_services.base64url import b64url_decode, b64url_encode
+from crypto_services.canonical import (
     assert_valid_ts,
     canonical_payload_bytes,
     preimage_file_chunk,
     preimage_keyshare,
     preimage_public,
 )
-from .crypto_services.rsa import (
+from crypto_services.rsa import (
     encrypt_rsa_oaep,
     load_private_key_der,
     load_public_key_b64url,
     sign_pss_sha256,
     verify_pss_sha256,
 )
-from .crypto_services.secure_store import get_password_hasher
-from .database import SecureMessagingDB
-from .transport import (
+from crypto_services.secure_store import get_password_hasher
+from database import SecureMessagingDB
+from transport import (
     generate_server_keys,
     sign_transport_payload,
     verify_transport_payload,
@@ -932,13 +932,13 @@ class ServerCore:
         ts = envelope.get("ts") or 0
         ok = False
         try:
-            from .crypto_services.base64url import b64url_decode
-            from .crypto_services.canonical import preimage_dm
-            from .crypto_services.rsa import load_public_key_b64url
+            from crypto_services.base64url import b64url_decode
+            from crypto_services.canonical import preimage_dm
+            from crypto_services.rsa import load_public_key_b64url
 
             spub = load_public_key_b64url(sender_pub_b64)
             pm = preimage_dm(ct_b64, sender, to_user, ts)
-            from .crypto_services.rsa import verify_pss_sha256
+            from crypto_services.rsa import verify_pss_sha256
 
             ok = verify_pss_sha256(pm, b64url_decode(sig_b64), spub)
         except Exception:

@@ -1,6 +1,6 @@
 from typing import Any, Dict, Tuple
 
-from .crypto_services.rsa import (
+from crypto_services.rsa import (
     generate_rsa4096_keypair,
     private_key_to_der,
     public_key_to_b64url,
@@ -9,8 +9,8 @@ from .crypto_services.rsa import (
     load_public_key_b64url,
     load_private_key_der,
 )
-from .crypto_services.canonical import canonical_payload_bytes
-from .crypto_services.base64url import b64url_encode, b64url_decode
+from crypto_services.canonical import canonical_payload_bytes
+from crypto_services.base64url import b64url_encode, b64url_decode
 
 
 def generate_server_keys() -> Tuple[bytes, str]:

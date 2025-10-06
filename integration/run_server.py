@@ -8,8 +8,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .database import USERNAME_TAKEN, SecureMessagingDB
-from .network_protocol_core import main_loop as core_main_loop
+from database import USERNAME_TAKEN, SecureMessagingDB
+from network_protocol_core import main_loop as core_main_loop
 
 
 def _parse_bind(bind_uri: str) -> tuple[str, int]:

@@ -1,7 +1,7 @@
 import os
 import argparse
 import asyncio
-from .client import Client, Colors, colorize
+from client import Client, Colors, colorize
 
 
 def _parse_server(uri_or_host: str | None, port: int | None) -> tuple[str, int]:
@@ -16,7 +16,7 @@ def _parse_server(uri_or_host: str | None, port: int | None) -> tuple[str, int]:
 def main():
     # Print welcome message
     print(colorize("=" * 60, Colors.CYAN))
-    print(colorize("🔐 SOCP Secure Messaging Client", Colors.CYAN + Colors.BOLD))
+    print(colorize("SOCP Secure Messaging Client", Colors.CYAN + Colors.BOLD))
     print(colorize("=" * 60, Colors.CYAN))
     print(colorize("Commands:", Colors.YELLOW))
     print(colorize("  /register          - Register new user", Colors.WHITE))

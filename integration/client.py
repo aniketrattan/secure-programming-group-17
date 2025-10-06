@@ -46,7 +46,7 @@ def colorize(text, color):
         pass
     return text
 
-from .crypto_services import (
+from crypto_services import (
     b64url_decode,
     b64url_encode,
     decrypt_rsa_oaep,
@@ -63,14 +63,14 @@ from .crypto_services import (
     sign_pss_sha256,
     verify_pss_sha256,
 )
-from .crypto_services.secure_store import (
+from crypto_services.secure_store import (
     get_password_hasher,
     protect_private_key,
     recover_private_key,
 )
-from .customised_types import CustomisedMessageType, ServerMessageType, UserAuthType
-from .protocol import make_envelope, parse_envelope
-from .transport import verify_transport_payload
+from customised_types import CustomisedMessageType, ServerMessageType, UserAuthType
+from protocol import make_envelope, parse_envelope
+from transport import verify_transport_payload
 
 HTTP_DIR = os.getenv("HTTP_DIR", "http://127.0.0.1:8080")
 
@@ -610,7 +610,7 @@ class Client:
                     print("[Public] missing fields")
                     continue
                 try:
-                    from .crypto_services import assert_valid_ts
+                    from crypto_services import assert_valid_ts
 
                     assert_valid_ts(ts)
                 except Exception:
@@ -657,7 +657,7 @@ class Client:
                 ts = frame["ts"]
                 total = int(p.get("total", 0))
                 try:
-                    from .crypto_services import assert_valid_ts
+                    from crypto_services import assert_valid_ts
 
                     assert_valid_ts(ts)
                 except Exception:

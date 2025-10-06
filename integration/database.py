@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from .crypto_services.rsa import load_public_key_b64url
+from crypto_services.rsa import load_public_key_b64url
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -84,7 +84,7 @@ class SecureMessagingDB:
         self.init_database()
 
     def canonicalize_username(self, raw: str) -> str:
-        from .crypto_services.canonical import to_canonical_username
+        from crypto_services.canonical import to_canonical_username
 
         return to_canonical_username(raw)
 
