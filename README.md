@@ -1,4 +1,4 @@
-# 🔐 Secure Overlay Chat Protocol (SOCP) – Implementation
+# 🔐 Vulnerable Implementation - Group 17
 
 > **A decentralized, end-to-end encrypted messaging system with server-to-server routing over WebSockets**
 
