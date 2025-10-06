@@ -34,7 +34,6 @@ from transport import (
     verify_transport_payload,
 )
 
-
 PUBLIC_GROUP_ID = "public"
 HEARTBEAT_INTERVAL = 15
 HEARTBEAT_TIMEOUT = 45
@@ -198,7 +197,8 @@ class ServerCore:
         conn = PeerConnection(ws, is_server=is_server, remote_id=remote_id)
         async with self.lock:
             self.connections[ws] = conn
-            if is_server and remote_id:
+            # Don't add to server_peers here for 'auto' servers - let handle_server_join do it
+            if is_server and remote_id and remote_id.lower() != "auto":
                 self.server_peers[remote_id] = conn
 
         # Complete handshake or process initial client auth
@@ -254,6 +254,29 @@ class ServerCore:
                     # Remove old mapping if it exists
                     if remote_id and remote_id != assigned_id:
                         self.server_peers.pop(remote_id, None)
+                if remote_pub:
+                    self.server_pubkeys[assigned_id] = remote_pub
+                    if remote_id and remote_id != assigned_id:
+                        self.server_pubkeys.pop(remote_id, None)
+                if ws_uri:
+                    self.server_addrs[assigned_id] = {"ws_uri": ws_uri}
+                    if remote_id and remote_id != assigned_id:
+                        self.server_addrs.pop(remote_id, None)
+                logging.info(
+                    "Server %s assigned ID %s to connecting server %s",
+                    self.server_id,
+                    assigned_id,
+                    remote_id,
+                )
+            else:
+                # Server already has an ID, use it
+                async with self.lock:
+                    self.server_peers[remote_id] = conn
+                logging.info(
+                    "Server %s accepted connection from server %s",
+                    self.server_id,
+                    remote_id,
+                )
         except Exception:
             assigned_id = None
         welcome = self._make_envelope(
@@ -748,7 +771,9 @@ class ServerCore:
                                     "ciphertext": payload.get("ciphertext", ""),
                                     "sender_pub": payload.get("sender_pub", ""),
                                     "content_sig": payload.get("content_sig", ""),
-                                    "public_version": payload.get("public_version", self.public_group_version),
+                                    "public_version": payload.get(
+                                        "public_version", self.public_group_version
+                                    ),
                                 },
                             }
                             out["sig"] = self.sign_envelope(out)
@@ -777,7 +802,9 @@ class ServerCore:
                                 "ciphertext": payload.get("ciphertext", ""),
                                 "sender_pub": payload.get("sender_pub", ""),
                                 "content_sig": payload.get("content_sig", ""),
-                                "public_version": payload.get("public_version", self.public_group_version),
+                                "public_version": payload.get(
+                                    "public_version", self.public_group_version
+                                ),
                             },
                         }
                         fwd["sig"] = self.sign_envelope(fwd)
@@ -813,7 +840,9 @@ class ServerCore:
                         "ciphertext": payload.get("ciphertext", ""),
                         "sender_pub": payload.get("sender_pub", ""),
                         "content_sig": payload.get("content_sig", ""),
-                        "public_version": payload.get("public_version", self.public_group_version),
+                        "public_version": payload.get(
+                            "public_version", self.public_group_version
+                        ),
                     },
                 }
                 out["sig"] = self.sign_envelope(out)
@@ -838,7 +867,9 @@ class ServerCore:
                     "ciphertext": payload.get("ciphertext", ""),
                     "sender_pub": payload.get("sender_pub", ""),
                     "content_sig": payload.get("content_sig", ""),
-                    "public_version": payload.get("public_version", self.public_group_version),
+                    "public_version": payload.get(
+                        "public_version", self.public_group_version
+                    ),
                 },
             }
             fwd["sig"] = self.sign_envelope(fwd)
@@ -917,7 +948,9 @@ class ServerCore:
             # Just forward the remove, don't bump version
             await self.broadcast_to_servers(envelope)
 
-    async def _handle_user_message(self, conn: PeerConnection, envelope: Dict[str, Any]):
+    async def _handle_user_message(
+        self, conn: PeerConnection, envelope: Dict[str, Any]
+    ):
         payload = envelope.get("payload", {})
         to_user = envelope.get("to") or payload.get("to_user")
         if not to_user:
@@ -1235,11 +1268,18 @@ class ServerCore:
                     payload = msg.get("payload", {}) or {}
                     remote_pub = payload.get("server_pub")
                     sender_id = msg.get("from")
+                    assigned_id = payload.get("assigned_id")
+
                     if remote_pub and sender_id:
                         self.server_pubkeys[sender_id] = remote_pub
                         logging.info(
                             "Learned pubkey for peer %s during handshake", sender_id
                         )
+
+                    async with self.lock:
+                        self.server_peers[sender_id] = conn
+                        conn.remote_id = sender_id
+
                 await self.handle_envelope(conn, msg)
             except Exception:
                 pass
@@ -1323,7 +1363,7 @@ async def main_loop(host: str, port: int, server_id: str, peer_uris: list):
 
     # Start status printer as a background task
     status_task = asyncio.create_task(status_printer())
-    
+
     try:
         # Keep the main loop running
         await asyncio.Event().wait()
