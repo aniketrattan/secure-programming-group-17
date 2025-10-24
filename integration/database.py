@@ -672,13 +672,6 @@ class SecureMessagingDB:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("BEGIN TRANSACTION")
 
-                group_key = self.generate_group_key()
-
-                # Store group key in meta (for future member additions)
-                meta_dict = meta.copy() if meta else {}
-                meta_dict["group_key_hex"] = group_key.hex()
-                meta_json = json.dumps(meta_dict)
-
                 conn.execute(
                     """
                     INSERT INTO groups (group_id, creator_id, created_at, meta, version)
@@ -687,23 +680,10 @@ class SecureMessagingDB:
                     (group_id, creator_id, created_at, meta_json),
                 )
 
-                if self.crypto:
-                    # Get creator's public key
-                    creator_pubkey = self.get_pubkey(creator_id)
-                    if not creator_pubkey:
-                        raise ValueError(
-                            f"Public key not found for creator {creator_id}"
-                        )
-
-                    # Wrap the group key for the creator
-                    wrapped_key = self.wrap_group_key(group_key, creator_pubkey)
-                    logger.info(f"Generated wrapped key for creator {creator_id}")
-                else:
-                    # Fallback if crypto not available (for testing)
-                    wrapped_key = f"wrapped_key_for_{creator_id}"
-                    logger.warning(
-                        "Crypto module not available, using placeholder wrapped key"
-                    )
+                # Do not persist clear group key in DB meta. Per SOCP §11.2,
+                # only per-member wrapped keys are stored. Create placeholder
+                # wrapped key for creator; server layer may update later.
+                wrapped_key = f"wrapped_key_for_{creator_id}"
 
                 conn.execute(
                     """

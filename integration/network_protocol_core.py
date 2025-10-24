@@ -41,6 +41,13 @@ SEEN_CACHE_SIZE = 2000
 RECONNECT_BASE = 2
 RECONNECT_MAX = 60
 
+# Basic DoS safeguards
+MAX_PAYLOAD_LEN = 64 * 1024  # 64KB per message payload
+MAX_FILE_CHUNK_LEN = 64 * 1024  # 64KB per file chunk ciphertext (base64url)
+MAX_PUBLIC_MSG_LEN = 64 * 1024
+RATE_LIMIT_WINDOW = 2.0  # seconds
+RATE_LIMIT_BURST = 64    # allow burst per sender within window (sized to permit file chunks)
+
 # Envelope keys: type, from, to, ts, payload, sig
 
 
@@ -116,6 +123,9 @@ class ServerCore:
         # Public channel version tracking (for PUBLIC_MEMBERS_SNAPSHOT/UPDATED)
         self.public_group_version = 1
         self.public_group_key = os.urandom(32)
+        # Per-sender simple rate limiter state: sender_id -> [timestamps]
+        from collections import defaultdict, deque
+        self._rate_events = defaultdict(lambda: deque())
 
     def sign_envelope(self, envelope: Dict[str, Any]) -> str:
         payload = envelope.get("payload", {})
@@ -490,6 +500,17 @@ class ServerCore:
                     logging.debug("Received non-json, ignoring")
                     continue
 
+                # Hard cap payload size to mitigate DoS from oversized frames
+                try:
+                    payload = envelope.get("payload", {})
+                    if isinstance(payload, dict):
+                        b = canonical_payload_bytes(payload)
+                        if len(b) > MAX_PAYLOAD_LEN:
+                            logging.warning("Dropping oversized payload len=%s", len(b))
+                            continue
+                except Exception:
+                    pass
+
                 conn.touch()
                 # Transport verify gate for server→server frames (skip only initial SERVER_HELLO_JOIN per SOCP)
                 if conn.is_server:
@@ -533,6 +554,22 @@ class ServerCore:
                 # Duplicate suppression (payload-aware)
                 if self._dedup_and_mark(envelope):
                     continue
+
+                # Apply simple token-bucket-like rate limiting per sender
+                try:
+                    sender_id = envelope.get("from") or ""
+                    now = time.time()
+                    q = self._rate_events[sender_id]
+                    # purge old
+                    while q and now - q[0] > RATE_LIMIT_WINDOW:
+                        q.popleft()
+                    if len(q) >= RATE_LIMIT_BURST:
+                        # Exceeded burst within window
+                        logging.warning("Rate limit exceeded by %s; dropping %s", sender_id, envelope.get("type"))
+                        continue
+                    q.append(now)
+                except Exception:
+                    pass
 
                 await self.handle_envelope(conn, envelope)
         except websockets.exceptions.ConnectionClosed:
@@ -679,6 +716,14 @@ class ServerCore:
         recipient = envelope.get("to")
         if not recipient:
             return
+        # Size cap for file chunk ciphertext
+        if typ == "FILE_CHUNK":
+            p = envelope.get("payload", {}) or {}
+            ct_b64 = p.get("ciphertext", "")
+            if isinstance(ct_b64, str) and len(ct_b64) > MAX_FILE_CHUNK_LEN * 2:
+                # base64url expands ~4/3; be conservative and cap string length
+                logging.warning("Dropping oversized FILE_CHUNK from %s", sender)
+                return
         async with self.lock:
             loc = self.user_locations.get(recipient)
         if loc is None:
@@ -732,6 +777,10 @@ class ServerCore:
         ct_b64 = payload.get("ciphertext", "")
         sender_pub_b64 = payload.get("sender_pub", "")
         sig_b64 = payload.get("content_sig", "")
+        # Size cap for public messages
+        if isinstance(ct_b64, str) and len(ct_b64) > MAX_PUBLIC_MSG_LEN * 2:
+            logging.info("Public message too large; dropping")
+            return
         ok = False
         try:
             sender_pub = load_public_key_b64url(sender_pub_b64)
@@ -955,6 +1004,12 @@ class ServerCore:
         to_user = envelope.get("to") or payload.get("to_user")
         if not to_user:
             logging.debug("User_message without recipient")
+            return
+
+        # Size cap for DM ciphertext
+        ct_b64 = payload.get("ciphertext", "")
+        if isinstance(ct_b64, str) and len(ct_b64) > MAX_PAYLOAD_LEN * 2:
+            logging.info("DM too large; dropping")
             return
 
         # Server-side content_sig verification (drop malformed early)
