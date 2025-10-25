@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import hashlib
 import pathlib
 import time
 import urllib.parse
@@ -130,9 +131,28 @@ class Client:
         self._name_cache = {}
         self._login_future = None
         self._register_future = None
-        # Public channel state (stored, not used for encryption)
+        # Public channel state
         self.public_group_version = None
         self.public_group_key = None
+
+    def _public_label(self, version: int) -> bytes:
+        """Derive OAEP label for public channel using current group key.
+
+        If group key is known, bind the label to ("public"|version|group_key) via SHA-256.
+        Else, fall back to legacy version-only label for compatibility.
+        """
+        try:
+            v_bytes = str(int(version or 1)).encode()
+        except Exception:
+            v_bytes = b"1"
+        if self.public_group_key:
+            h = hashlib.sha256()
+            h.update(b"public|")
+            h.update(v_bytes)
+            h.update(b"|")
+            h.update(self.public_group_key)
+            return h.digest()
+        return f"public-v{version or 1}".encode()
 
     def _label(self, uid: str) -> str:
         if not uid:
@@ -477,7 +497,11 @@ class Client:
                 if not members:
                     print("[Public] no members")
                     continue
-                label = f"public-v{self.public_group_version or version or 1}".encode()
+                # Require installed group key for full SOCP compliance
+                if not self.public_group_key:
+                    print("[Public] group key not installed yet; waiting for key-share before sending")
+                    continue
+                label = self._public_label(self.public_group_version or version or 1)
                 mode = PUBLIC_SEND_MODE
                 if mode != "direct":
                     print("[Public] PUBLIC_SEND_MODE=broadcast requires a group key; falling back to direct per-recipient sends")
@@ -624,19 +648,26 @@ class Client:
                     print("[Public] bad content sig")
                     continue
                 ver = payload.get("public_version") or (self.public_group_version or 1)
-                label = f"public-v{ver}".encode()
+                # Prefer group-key-bound label; fall back to legacy if not installed
+                label = self._public_label(ver)
                 try:
                     pt = decrypt_rsa_oaep(
                         b64url_decode(ct_b64), self._priv, label=label
                     )
                 except Exception as e:
-                    print(f"[Public] decrypt failed: {e}")
-                    print(f"  Ciphertext length: {len(ct_b64)}")
-                    print(f"  Sender: {sender}")
-                    print(f"  Version: {ver}")
-                    print(f"  Label: {label}")
-                    print(f"  Private key available: {self._priv is not None}")
-                    continue
+                    # Try legacy label if we failed and have a group key present (for mixed deployments)
+                    try:
+                        legacy_label = f"public-v{ver}".encode()
+                        pt = decrypt_rsa_oaep(
+                            b64url_decode(ct_b64), self._priv, label=legacy_label
+                        )
+                    except Exception:
+                        print(f"[Public] decrypt failed: {e}")
+                        print(f"  Ciphertext length: {len(ct_b64)}")
+                        print(f"  Sender: {sender}")
+                        print(f"  Version: {ver}")
+                        print(f"  Private key available: {self._priv is not None}")
+                        continue
                 print(colorize(f"[Public] {self._label(sender)}: {pt.decode('utf-8', errors='replace')}", Colors.MAGENTA))
             elif frame["type"] == "PUBKEY_RESPONSE":
                 payload = frame.get("payload", {})
@@ -707,11 +738,22 @@ class Client:
                 except Exception:
                     print("[Public] key-share verification error; ignoring")
                     continue
+                # Use exact field name 'wrapped' if present to match signature preimage
                 for s in shares:
                     if s.get("member") == self._user_id:
-                        # Store wrapped key (we do not decrypt for RSA-only wire)
-                        self.public_group_version = v
-                        print(f"[Public] received key-share (v{v})")
+                        wrapped_b64 = s.get("wrapped")
+                        if not wrapped_b64:
+                            print("[Public] missing wrapped field in share; ignoring")
+                            continue
+                        try:
+                            # Unwrap group key with RSA-OAEP label bound to version
+                            label = f"public-v{v or 1}".encode()
+                            gk = decrypt_rsa_oaep(b64url_decode(wrapped_b64), self._priv, label=label)
+                            self.public_group_key = gk
+                            self.public_group_version = v or self.public_group_version or 1
+                            print(f"[Public] installed group key for v{self.public_group_version}")
+                        except Exception as e:
+                            print(f"[Public] failed to unwrap group key: {e}")
             elif frame["type"] == ServerMessageType.PUBLIC_CHANNEL_UPDATED:
                 payload = frame.get("payload", {})
                 new_v = payload.get("version")

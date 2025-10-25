@@ -26,6 +26,7 @@ from crypto_services.rsa import (
     sign_pss_sha256,
     verify_pss_sha256,
 )
+from crypto_services.base64url import b64url_encode
 from crypto_services.secure_store import get_password_hasher
 from database import SecureMessagingDB
 from transport import (
@@ -141,6 +142,84 @@ class ServerCore:
             return False
         payload = envelope.get("payload", {})
         return verify_transport_payload(payload, sig, pub_b64)
+
+    async def _broadcast_public_key_shares(self) -> None:
+        """Generate per-member RSA-OAEP wrapped group key and broadcast shares.
+
+        SOCP: distribute wrapped key via PUBLIC_CHANNEL_KEY_SHARE after version bump.
+        """
+        try:
+            members = self.db.get_public_members()
+        except Exception:
+            members = []
+        if not members:
+            return
+        shares = []
+        for uid in members:
+            try:
+                pub_b64 = self.db.get_pubkey(uid)
+                if not pub_b64:
+                    continue
+                pub = load_public_key_b64url(pub_b64)
+                # Wrap group key with RSA-OAEP(SHA256); include label with version
+                label = f"public-v{self.public_group_version}".encode()
+                wrapped = encrypt_rsa_oaep(self.public_group_key, pub, label=label)
+                share = {
+                    "member": uid,
+                    "wrapped": b64url_encode(wrapped),
+                }
+                shares.append(share)
+                # Persist wrapped key per member
+                try:
+                    self.db.set_wrapped_public_key(uid, share["wrapped"], int(time.time()))
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        # Sign shares (content_sig = PSS(SHA256(shares || creator_pub)))
+        payload = {
+            "version": self.public_group_version,
+            "shares": shares,
+            "creator_pub": self.server_pub_b64,
+        }
+        pm = preimage_keyshare(payload["shares"], self.server_pub_b64)
+        try:
+            priv = load_private_key_der(self._priv_der)
+            content_sig = b64url_encode(sign_pss_sha256(pm, priv))
+        except Exception:
+            content_sig = ""
+        payload["content_sig"] = content_sig
+
+        # Broadcast to servers; each server will deliver to its local members
+        env = self._make_envelope(
+            "PUBLIC_CHANNEL_KEY_SHARE", self.server_id, "*", payload=payload
+        )
+        await self.broadcast_to_servers(env)
+        # Also deliver directly to our local members with the SAME payload (unaltered)
+        try:
+            async with self.lock:
+                local_ids = [
+                    uid for uid, loc in self.user_locations.items() if loc.get("server_id") == self.server_id
+                ]
+            for uid in local_ids:
+                async with self.lock:
+                    ws = self.local_clients.get(uid)
+                if not ws:
+                    continue
+                out = {
+                    "type": "PUBLIC_CHANNEL_KEY_SHARE",
+                    "from": self.server_id,
+                    "to": uid,
+                    "ts": int(time.time() * 1000),
+                    "payload": payload,
+                }
+                out["sig"] = self.sign_envelope(out)
+                try:
+                    await ws.send(json.dumps(out))
+                except Exception:
+                    pass
+        except Exception:
+            logging.exception("local delivery of key shares failed")
 
     def _make_seen_key(self, envelope: Dict[str, Any]) -> str:
         typ = envelope.get("type")
@@ -665,7 +744,7 @@ class ServerCore:
                 await conn.ws.send(json.dumps(out))
             except Exception:
                 pass
-        elif typ == "PUBKEY_REQUEST" or typ == "PUBLIC_MEMBERS_SNAPSHOT":
+        elif typ == "PUBKEY_REQUEST" or typ == "PUBLIC_MEMBERS_SNAPSHOT" or typ == "PUBLIC_CHANNEL_KEY_SHARE":
             # Return recipient's pubkey from DB if available
             pld = envelope.get("payload", {}) or {}
             if typ == "PUBLIC_MEMBERS_SNAPSHOT":
@@ -679,6 +758,45 @@ class ServerCore:
                     envelope.get("from") or "*",
                     payload=resp_payload,
                 )
+            elif typ == "PUBLIC_CHANNEL_KEY_SHARE":
+                # A server-originated key-share frame: deliver to local members included in shares
+                try:
+                    shares = pld.get("shares", [])
+                except Exception:
+                    shares = []
+                for s in shares:
+                    try:
+                        member_id = s.get("member")
+                        wrapped = s.get("wrapped") or s.get("wrapped_key")
+                        if not member_id or not wrapped:
+                            continue
+                        # Persist wrapped share for this member
+                        try:
+                            self.db.set_wrapped_public_key(member_id, wrapped, int(time.time()))
+                        except Exception:
+                            pass
+                        # Deliver full, unmodified payload so content_sig remains valid
+                        async with self.lock:
+                            loc = self.user_locations.get(member_id)
+                            ws = self.local_clients.get(member_id) if loc and loc.get("server_id") == self.server_id else None
+                        if not ws:
+                            continue
+                        out = {
+                            "type": "PUBLIC_CHANNEL_KEY_SHARE",
+                            "from": self.server_id,
+                            "to": member_id,
+                            "ts": envelope.get("ts") or int(time.time() * 1000),
+                            "payload": pld,
+                        }
+                        out["sig"] = self.sign_envelope(out)
+                        try:
+                            await ws.send(json.dumps(out))
+                        except Exception:
+                            pass
+                    except Exception:
+                        logging.exception("error delivering PUBLIC_CHANNEL_KEY_SHARE to %s", s)
+                # Do not re-broadcast key-shares to avoid loops
+                return
             else:
                 target = pld.get("user_id")
                 pub = self.db.get_pubkey(target) if target else None
@@ -942,6 +1060,8 @@ class ServerCore:
                 self.db.add_member_to_public(user_id)
                 nv = self.db.update_group_version("public")
                 self.public_group_version = nv
+                # Rotate the group key on version bump
+                self.public_group_key = os.urandom(32)
             except Exception:
                 self.public_group_version += 1
             upd_payload = {"version": self.public_group_version, "added": [user_id]}
@@ -954,6 +1074,11 @@ class ServerCore:
                 [user_id],
             )
             await self.broadcast_to_servers(upd)
+            # Broadcast key shares for the new version
+            try:
+                await self._broadcast_public_key_shares()
+            except Exception:
+                logging.exception("failed to broadcast public key shares")
         else:
             # Just forward the advertise, don't bump version
             await self.broadcast_to_servers(envelope)
@@ -981,6 +1106,8 @@ class ServerCore:
                 self.db.remove_member_from_public(user_id)
                 nv = self.db.update_group_version("public")
                 self.public_group_version = nv
+                # Rotate the group key on version bump
+                self.public_group_key = os.urandom(32)
             except Exception:
                 self.public_group_version += 1
             upd_payload = {"version": self.public_group_version, "removed": [user_id]}
@@ -993,6 +1120,11 @@ class ServerCore:
                 [user_id],
             )
             await self.broadcast_to_servers(upd)
+            # Broadcast key shares for the new version
+            try:
+                await self._broadcast_public_key_shares()
+            except Exception:
+                logging.exception("failed to broadcast public key shares")
         else:
             # Just forward the remove, don't bump version
             await self.broadcast_to_servers(envelope)
