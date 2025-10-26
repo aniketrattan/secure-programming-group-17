@@ -10,7 +10,7 @@
 |------|-------------|
 | **Ammar Amin** | [ID] | 
 | **Aniket Rattan** | [ID] | 
-| **Howard Tang** | [ID] | 
+| **Howard Tang** | a1955452 | 
 | **Leslie Nguyen** | a1840168 |
 | **Vincent Guan** | [ID] |
 
