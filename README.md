@@ -8,11 +8,11 @@
 
 | Name | Student ID | 
 |------|-------------|
-| **Ammar Amin** | [ID] | 
+| **Ammar Amin** | a1949118 | 
 | **Aniket Rattan** | a1897195 | 
 | **Howard Tang** | a1955452 | 
 | **Leslie Nguyen** | a1840168 |
-| **Vincent Guan** | [ID] |
+| **Vincent Guan** | a1952075 |
 
 
 
