@@ -1,20 +1,8 @@
-# 🔐 Secure Overlay Chat Protocol (SOCP) – Implementation
+# 🔐 Vulnerable Implementation - Group 17
 
 > **A decentralized, end-to-end encrypted messaging system with server-to-server routing over WebSockets**
 
 ---
-
-## 👥 Team Members
-
-| Name | Student ID | 
-|------|-------------|
-| **Ammar Amin** | [ID] | 
-| **Aniket Rattan** | a1897195 | 
-| **Howard Tang** | a1955452 | 
-| **Leslie Nguyen** | a1840168 |
-| **Vincent Guan** | [ID] |
-
-
 
 ## 🚀 Quick Start
 
@@ -49,24 +37,6 @@ python run_server.py --bind ws://127.0.0.1:8767 --server-id auto --peer ws://127
 - ✅ Periodic status shows all servers in "Known servers"
 
 > **💡 Note:** Use different ports for each server.
-
-**Address Error**
-The error can be returned due to different OS. If you encountered error when starting servers, please try the below commands.
-
-
-```bash
-# Introducer server
-python run_server.py --bind ws://127.0.0.1:8765 --server-id auto --http 127.0.0.1:8080
-```
-
-```bash
-# Additional servers
-python run_server.py --bind ws://127.0.0.1:8766 --server-id auto --peer ws://127.0.0.1:8765 --http 127.0.0.1:8081
-
-python run_server.py --bind ws://127.0.0.1:8767 --server-id auto --peer ws://127.0.0.1:8765 --http 127.0.0.1:8082
-```
-
-
 
 ### 👥 Client Setup
 
