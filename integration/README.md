@@ -4,6 +4,18 @@
 
 ---
 
+## 👥 Team Members
+
+| Name | Student ID | 
+|------|-------------|
+| **Ammar Amin** | [ID] | 
+| **Aniket Rattan** | [ID] | 
+| **Howard Tang** | [ID] | 
+| **Leslie Nguyen** | a1840168 |
+| **Vincent Guan** | [ID] |
+
+
+
 ## 🚀 Quick Start
 
 ### Installation
